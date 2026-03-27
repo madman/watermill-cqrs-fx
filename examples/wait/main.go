@@ -92,7 +92,7 @@ func main() {
 				return db, err
 			},
 			func(db *sql.DB) wcqrs.CommandExecutionStore {
-				return wcqrs.NewSQLCommandExecutionStore(db, "command_executions")
+				return wcqrs.NewSQLCommandExecutionStore(db, "command_executions", wcqrs.DialectSQLite)
 			},
 			// Registration of handlers
 			NewUserHandlerWait,

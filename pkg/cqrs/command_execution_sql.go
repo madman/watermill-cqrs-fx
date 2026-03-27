@@ -7,28 +7,51 @@ import (
 	"fmt"
 )
 
+type Dialect string
+
+const (
+	DialectSQLite Dialect = "sqlite"
+	DialectMySQL  Dialect = "mysql"
+)
+
 type sqlCommandExecutionStore struct {
 	db        *sql.DB
 	tableName string
+	dialect   Dialect
 }
 
-func NewSQLCommandExecutionStore(db *sql.DB, tableName string) CommandExecutionStore {
+func NewSQLCommandExecutionStore(db *sql.DB, tableName string, dialect Dialect) CommandExecutionStore {
 	return &sqlCommandExecutionStore{
 		db:        db,
 		tableName: tableName,
+		dialect:   dialect,
 	}
 }
 
 func (s *sqlCommandExecutionStore) RecordStarted(ctx context.Context, tx Tx, commandID string, handlerName string) error {
-	query := fmt.Sprintf(`
-		INSERT INTO %s (command_id, handler_name, status, started_at)
-		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(command_id) DO UPDATE SET
-			status = excluded.status,
-			started_at = excluded.started_at,
-			finished_at = NULL,
-			error_data = NULL
-	`, s.tableName)
+	var query string
+	if s.dialect == DialectMySQL {
+		query = fmt.Sprintf(`
+			INSERT INTO %s (command_id, handler_name, status, started_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+			ON DUPLICATE KEY UPDATE
+				status = VALUES(status),
+				started_at = VALUES(started_at),
+				finished_at = NULL,
+				error_data = NULL
+		`, s.tableName)
+	} else {
+		// Default to SQLite/PostgreSQL syntax
+		query = fmt.Sprintf(`
+			INSERT INTO %s (command_id, handler_name, status, started_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(command_id) DO UPDATE SET
+				status = excluded.status,
+				started_at = excluded.started_at,
+				finished_at = NULL,
+				error_data = NULL
+		`, s.tableName)
+	}
 
 	_, err := tx.ExecContext(ctx, query, commandID, handlerName, CommandExecutionStatusPending)
 	return err

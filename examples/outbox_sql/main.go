@@ -107,7 +107,7 @@ func main() {
 				return wcqrs.NewSQLTransactionManager(db)
 			},
 			func(db *sql.DB) wcqrs.CommandExecutionStore {
-				return wcqrs.NewSQLCommandExecutionStore(db, "command_executions")
+				return wcqrs.NewSQLCommandExecutionStore(db, "command_executions", wcqrs.DialectSQLite)
 			},
 
 			// Register handlers
