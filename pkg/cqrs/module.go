@@ -98,6 +98,7 @@ func NewCommandProcessor(params ProcessorParams) (*cqrs.CommandProcessor, error)
 					next:      ch,
 					txManager: params.TxManager,
 					execStore: params.ExecStore,
+					logger:    params.Logger,
 				})
 			} else {
 				// If no TxManager, we still need to satisfy Watermill's interface.
@@ -125,6 +126,15 @@ func NewCommandProcessor(params ProcessorParams) (*cqrs.CommandProcessor, error)
 		return nil, err
 	}
 
+	for _, h := range handlers {
+		cmdName := params.Marshaler.Name(h.NewCommand())
+		params.Logger.Info("Registering command handler", watermill.LogFields{
+			"handler_name": h.HandlerName(),
+			"command_name": cmdName,
+			"topic":        cmdName, // Topic generation logic is name-based in this config
+		})
+	}
+
 	if err := cp.AddHandlers(handlers...); err != nil {
 		return nil, err
 	}
@@ -136,6 +146,7 @@ type transactionalCommandHandler struct {
 	next      CommandHandler
 	txManager TransactionManager
 	execStore CommandExecutionStore
+	logger    watermill.LoggerAdapter
 }
 
 func (h *transactionalCommandHandler) HandlerName() string {
@@ -162,8 +173,8 @@ func (h *transactionalCommandHandler) Handle(ctx context.Context, cmd interface{
 				return err
 			}
 
-			if status == CommandExecutionStatusSuccess {
-				// Command already processed successfully, skip
+			if status == CommandExecutionStatusSuccess || status == CommandExecutionStatusFailed {
+				// Command already processed, skip
 				return nil
 			}
 
@@ -177,12 +188,18 @@ func (h *transactionalCommandHandler) Handle(ctx context.Context, cmd interface{
 			if h.execStore != nil {
 				var ce *cmderr.CommandError
 				if !errors.As(err, &ce) {
-					ce = cmderr.Wrap("COMMAND_FAILED", err, "execution error")
+					ce = cmderr.Wrap("COMMAND_FAILED", err, err.Error())
 				}
 				data, _ := ce.Encode()
 				if recErr := h.execStore.RecordFailure(ctx, tx, cc.CommandID(), data); recErr != nil {
 					return errors.Join(err, recErr)
 				}
+
+				h.logger.Error("Handler returned error (recorded as failure, will not retry)", err, watermill.LogFields{
+					"handler_name": h.HandlerName(),
+					"command_id":   cc.CommandID(),
+				})
+				return nil
 			}
 			return err
 		}
@@ -233,6 +250,15 @@ func NewEventProcessor(params ProcessorParams) (*cqrs.EventProcessor, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	for _, h := range handlers {
+		eventName := params.Marshaler.Name(h.NewEvent())
+		params.Logger.Info("Registering event handler", watermill.LogFields{
+			"handler_name": h.HandlerName(),
+			"event_name":   eventName,
+			"topic":        eventName,
+		})
 	}
 
 	if err := ep.AddHandlers(handlers...); err != nil {

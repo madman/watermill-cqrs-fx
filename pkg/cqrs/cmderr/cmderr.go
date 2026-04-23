@@ -139,6 +139,9 @@ func (e *CommandError) Error() string {
 	if e.Msg == "" {
 		return string(e.Code)
 	}
+	if e.Code == "COMMAND_FAILED" {
+		return e.Msg
+	}
 	return fmt.Sprintf("%s: %s", e.Code, e.Msg)
 }
 
