@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
-	"github.com/madman/watermill-cqrs-fx/pkg/cqrs/cmderr"
+	"github.com/madman/cmderr"
 )
 
 // CommandHandler defines the interface for handling commands with an explicit transaction.
@@ -110,7 +110,7 @@ func (b *commandBus) Wait(ctx context.Context, commandID string, timeout time.Du
 
 			if exec != nil && (exec.Status == CommandExecutionStatusSuccess || exec.Status == CommandExecutionStatusFailed) {
 				if exec.Status == CommandExecutionStatusFailed && len(exec.ErrorData) > 0 {
-					ce, err := cmderr.Decode(exec.ErrorData)
+					ce, err := cmderr.DecodeJSON(exec.ErrorData)
 					if err == nil {
 						return exec, ce
 					}

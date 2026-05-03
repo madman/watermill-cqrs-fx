@@ -7,7 +7,7 @@ import (
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
 	"github.com/ThreeDotsLabs/watermill/message"
-	"github.com/madman/watermill-cqrs-fx/pkg/cqrs/cmderr"
+	"github.com/madman/cmderr"
 	"go.uber.org/fx"
 )
 
@@ -190,7 +190,7 @@ func (h *transactionalCommandHandler) Handle(ctx context.Context, cmd interface{
 				if !errors.As(err, &ce) {
 					ce = cmderr.Wrap("COMMAND_FAILED", err, err.Error())
 				}
-				data, _ := ce.Encode()
+				data, _ := ce.EncodeJSON()
 				if recErr := h.execStore.RecordFailure(ctx, tx, cc.CommandID(), data); recErr != nil {
 					return errors.Join(err, recErr)
 				}
