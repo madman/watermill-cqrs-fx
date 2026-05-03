@@ -10,7 +10,7 @@ import (
 	"time"
 
 	wcqrs "github.com/madman/watermill-cqrs-fx/pkg/cqrs"
-	"github.com/madman/watermill-cqrs-fx/pkg/cqrs/cmderr"
+	"github.com/madman/cmderr"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
@@ -33,7 +33,18 @@ func (e *InsufficientFundsError) Error() string {
 
 func init() {
 	// Register the custom error
-	cmderr.RegisterType("INSUFFICIENT_FUNDS", &InsufficientFundsError{})
+	cmderr.RegisterCodec[*InsufficientFundsError](
+		"INSUFFICIENT_FUNDS",
+		func(e *InsufficientFundsError) (string, map[string]any) {
+			return e.Error(), map[string]any{"AccountID": e.AccountID, "Amount": e.Amount}
+		},
+		func(ce *cmderr.CommandError) *InsufficientFundsError {
+			return &InsufficientFundsError{
+				AccountID: ce.Details["AccountID"].(string),
+				Amount:    int(ce.Details["Amount"].(float64)), // JSON unmarshal converts numbers to float64
+			}
+		},
+	)
 }
 
 // --- Domain Commands ---
@@ -57,7 +68,7 @@ func (h *AccountHandler) Handle(ctx context.Context, tx wcqrs.Tx, cmd *WithdrawM
 	}
 
 	// Create a structured CommandError
-	return cmderr.New("INSUFFICIENT_FUNDS", domainErr)
+	return cmderr.WrapDomain("INSUFFICIENT_FUNDS", domainErr)
 }
 
 func NewAccountHandler() *AccountHandler {
