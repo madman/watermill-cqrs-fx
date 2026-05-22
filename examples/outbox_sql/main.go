@@ -58,7 +58,7 @@ func NewRegistrationWorker() *RegistrationWorker {
 func main() {
 	dbPath := filepath.Join(os.TempDir(), "outbox.db")
 	// Cleanup old DB
-	os.Remove(dbPath)
+	_ = os.Remove(dbPath)
 
 	app := fx.New(
 		wcqrs.Module,

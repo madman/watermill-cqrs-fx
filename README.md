@@ -12,10 +12,23 @@ This project implements a CQRS (Command Query Responsibility Segregation) approa
 ## Architecture
 
 The module will provide:
+
 - **Command Bus**: To dispatch commands to their respective handlers.
 - **Query Bus**: To execute queries and return results.
 - **Event Bus**: To publish events resulting from command execution.
 - **Automatic Registration**: Use Fx's provide/invoke patterns (likely using groups or tags) to automatically register handlers that implement specific interfaces.
+
+## Transactional & Fault-Tolerant CQRS (SQL Queue & Outbox)
+
+This module supports a highly resilient, single-transaction CQRS execution cycle where:
+
+1. Commands are queued directly in a database table.
+2. Background workers execute commands inside a single database transaction using row-level locking (`FOR UPDATE SKIP LOCKED`).
+3. Domain changes and emitted events (Outbox) are written to the database atomically.
+4. An asynchronous Outbox worker guarantees **At-Least-Once** event delivery to local or remote handlers.
+
+For sequence diagrams, setup instructions, and deep technical details of this approach, please refer to the:
+👉 **[Transactional CQRS Documentation](docs/transactional_cqrs.md)**
 
 ## Technology Stack
 

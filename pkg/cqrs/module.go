@@ -2,6 +2,7 @@ package cqrs
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -51,10 +52,11 @@ var Module = fx.Module("cqrs",
 		func(params struct {
 			fx.In
 			Bus       *cqrs.CommandBus
-			ExecStore CommandExecutionStore `optional:"true"`
-			Config    CommandBusConfig      `optional:"true"`
+			ExecStore CommandExecutionStore      `optional:"true"`
+			Marshaler cqrs.CommandEventMarshaler `optional:"true"`
+			Config    CommandBusConfig           `optional:"true"`
 		}) CommandBus {
-			return NewCommandBus(params.Bus, params.ExecStore, params.Config)
+			return NewCommandBus(params.Bus, params.ExecStore, params.Marshaler, params.Config)
 		},
 		NewEventBus,
 		// Provide QueryBus
@@ -64,10 +66,11 @@ var Module = fx.Module("cqrs",
 		}) (QueryBus, error) {
 			return NewQueryBus(params.Handlers)
 		},
-		// Provide Processors
+		// Provide Processors (Note: CommandProcessor is only used if SQL queue is NOT enabled)
 		NewCommandProcessor,
 		NewEventProcessor,
 	),
+	fx.Invoke(RunSQLWorkers),
 )
 
 type ProcessorParams struct {
@@ -102,7 +105,6 @@ func NewCommandProcessor(params ProcessorParams) (*cqrs.CommandProcessor, error)
 				})
 			} else {
 				// If no TxManager, we still need to satisfy Watermill's interface.
-				// We can either fail or pass nil Tx.
 				handlers = append(handlers, &handlerWrapper{next: ch})
 			}
 		} else if ch, ok := h.(cqrs.CommandHandler); ok {
@@ -166,7 +168,8 @@ func (h *transactionalCommandHandler) Handle(ctx context.Context, cmd interface{
 		})
 	}
 
-	return h.txManager.WithinTransaction(ctx, func(ctx context.Context, tx Tx) error {
+	var processErr error
+	err := h.txManager.WithinTransaction(ctx, func(ctx context.Context, tx Tx) error {
 		if h.execStore != nil {
 			status, err := h.execStore.GetStatus(ctx, tx, cc.CommandID())
 			if err != nil {
@@ -185,22 +188,8 @@ func (h *transactionalCommandHandler) Handle(ctx context.Context, cmd interface{
 
 		err := h.next.Handle(ctx, tx, cmd)
 		if err != nil {
-			if h.execStore != nil {
-				var ce *cmderr.CommandError
-				if !errors.As(err, &ce) {
-					ce = cmderr.Wrap("COMMAND_FAILED", err, err.Error())
-				}
-				data, _ := ce.EncodeJSON()
-				if recErr := h.execStore.RecordFailure(ctx, tx, cc.CommandID(), data); recErr != nil {
-					return errors.Join(err, recErr)
-				}
-
-				h.logger.Error("Handler returned error (recorded as failure, will not retry)", err, watermill.LogFields{
-					"handler_name": h.HandlerName(),
-					"command_id":   cc.CommandID(),
-				})
-				return nil
-			}
+			processErr = err
+			// Return error to trigger ROLLBACK of all aggregate changes
 			return err
 		}
 
@@ -212,6 +201,30 @@ func (h *transactionalCommandHandler) Handle(ctx context.Context, cmd interface{
 
 		return nil
 	})
+
+	if err != nil {
+		if processErr != nil && h.execStore != nil {
+			// The transaction rolled back because the handler failed.
+			// Now record the failure status in a separate short transaction.
+			var ce *cmderr.CommandError
+			if !errors.As(processErr, &ce) {
+				ce = cmderr.Wrap("COMMAND_FAILED", processErr, processErr.Error())
+			}
+			data, _ := ce.EncodeJSON()
+			if recErr := h.execStore.RecordFailure(ctx, nil, cc.CommandID(), data); recErr != nil {
+				return errors.Join(processErr, recErr)
+			}
+
+			h.logger.Error("Handler returned error (reverted changes, recorded failure)", processErr, watermill.LogFields{
+				"handler_name": h.HandlerName(),
+				"command_id":   cc.CommandID(),
+			})
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 type handlerWrapper struct {
@@ -266,6 +279,59 @@ func NewEventProcessor(params ProcessorParams) (*cqrs.EventProcessor, error) {
 	}
 
 	return ep, nil
+}
+
+func RunSQLWorkers(
+	lc fx.Lifecycle,
+	db *sql.DB,
+	execStore CommandExecutionStore,
+	txManager TransactionManager,
+	marshaler cqrs.CommandEventMarshaler,
+	publisher message.Publisher,
+	logger watermill.LoggerAdapter,
+	params struct {
+		fx.In
+		Config          CommandBusConfig `optional:"true"`
+		CommandHandlers []any            `group:"command_handlers"`
+		Outbox          Outbox           `optional:"true"`
+	},
+) {
+	var queueWorker *SQLCommandQueueWorker
+	var outboxWorker *SQLOutboxWorker
+
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			if params.Config.UseSQLQueue {
+				qw, err := NewSQLCommandQueueWorker(execStore, txManager, marshaler, logger, params.CommandHandlers)
+				if err != nil {
+					return err
+				}
+				if err := qw.Start(context.Background()); err != nil {
+					return err
+				}
+				queueWorker = qw
+			}
+
+			if params.Outbox != nil {
+				tableName := "events"
+				ow := NewSQLOutboxWorker(db, tableName, publisher, logger)
+				if err := ow.Start(context.Background()); err != nil {
+					return err
+				}
+				outboxWorker = ow
+			}
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			if queueWorker != nil {
+				_ = queueWorker.Stop()
+			}
+			if outboxWorker != nil {
+				_ = outboxWorker.Stop()
+			}
+			return nil
+		},
+	})
 }
 
 // Utility functions for registering handlers in Fx

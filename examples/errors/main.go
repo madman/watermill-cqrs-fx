@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
-	wcqrs "github.com/madman/watermill-cqrs-fx/pkg/cqrs"
 	"github.com/madman/cmderr"
+	wcqrs "github.com/madman/watermill-cqrs-fx/pkg/cqrs"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
@@ -77,7 +77,7 @@ func NewAccountHandler() *AccountHandler {
 
 func main() {
 	dbPath := filepath.Join(os.TempDir(), "errors_demo_refined.db")
-	os.Remove(dbPath)
+	_ = os.Remove(dbPath)
 
 	app := fx.New(
 		wcqrs.Module,

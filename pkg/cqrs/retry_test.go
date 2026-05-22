@@ -26,6 +26,7 @@ type retryMockCommand struct {
 }
 
 type retryMockTxManager struct{}
+
 func (m *retryMockTxManager) WithinTransaction(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
 	return fn(ctx, &retryMockTx{})
 }
@@ -55,32 +56,42 @@ func (m *retryMockExecStore) GetExecution(ctx context.Context, tx Tx, commandID 
 	args := m.Called(ctx, tx, commandID)
 	return args.Get(0).(*CommandExecution), args.Error(1)
 }
+func (m *retryMockExecStore) RecordPending(ctx context.Context, tx Tx, commandID string, commandName string, payload []byte) error {
+	return m.Called(ctx, tx, commandID, commandName, payload).Error(0)
+}
+func (m *retryMockExecStore) GetNextPending(ctx context.Context, tx Tx) (*CommandExecution, error) {
+	args := m.Called(ctx, tx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*CommandExecution), args.Error(1)
+}
 
 func TestTransactionalCommandHandler_RetryPrevention(t *testing.T) {
 	logger := watermill.NopLogger{}
 	txManager := &retryMockTxManager{}
-	
+
 	t.Run("returns nil and stops retry when handler fails and failure is recorded", func(t *testing.T) {
 		execStore := &retryMockExecStore{}
 		nextHandler := &retryMockCommandHandler{}
-		
+
 		h := &transactionalCommandHandler{
 			next:      nextHandler,
 			txManager: txManager,
 			execStore: execStore,
 			logger:    logger,
 		}
-		
+
 		cmd := &retryMockCommand{BaseCommand: BaseCommand{ID: "cmd-1"}}
 		domainErr := errors.New("domain error")
-		
+
 		execStore.On("GetStatus", mock.Anything, mock.Anything, "cmd-1").Return(CommandExecutionStatus(""), nil)
 		execStore.On("RecordStarted", mock.Anything, mock.Anything, "cmd-1", "RetryMockHandler").Return(nil)
 		nextHandler.On("Handle", mock.Anything, mock.Anything, cmd).Return(domainErr)
 		execStore.On("RecordFailure", mock.Anything, mock.Anything, "cmd-1", mock.Anything).Return(nil)
-		
+
 		err := h.Handle(context.Background(), cmd)
-		
+
 		assert.NoError(t, err, "Expected nil error to stop retries")
 		execStore.AssertExpectations(t)
 		nextHandler.AssertExpectations(t)
@@ -89,20 +100,20 @@ func TestTransactionalCommandHandler_RetryPrevention(t *testing.T) {
 	t.Run("returns nil immediately if command already failed", func(t *testing.T) {
 		execStore := &retryMockExecStore{}
 		nextHandler := &retryMockCommandHandler{}
-		
+
 		h := &transactionalCommandHandler{
 			next:      nextHandler,
 			txManager: txManager,
 			execStore: execStore,
 			logger:    logger,
 		}
-		
+
 		cmd := &retryMockCommand{BaseCommand: BaseCommand{ID: "cmd-2"}}
-		
+
 		execStore.On("GetStatus", mock.Anything, mock.Anything, "cmd-2").Return(CommandExecutionStatusFailed, nil)
-		
+
 		err := h.Handle(context.Background(), cmd)
-		
+
 		assert.NoError(t, err)
 		nextHandler.AssertNotCalled(t, "Handle", mock.Anything, mock.Anything, mock.Anything)
 	})

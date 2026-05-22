@@ -57,7 +57,7 @@ func NewUserHandlerWait(eb wcqrs.EventBus) *UserHandlerWait {
 func main() {
 	dbPath := filepath.Join(os.TempDir(), "wait.db")
 	// Cleanup old DB
-	os.Remove(dbPath)
+	_ = os.Remove(dbPath)
 
 	app := fx.New(
 		wcqrs.Module,
@@ -140,7 +140,9 @@ func main() {
 							BaseCommand: wcqrs.NewBaseCommand(),
 							Name:        "fail",
 						}
-						cb.Send(context.Background(), cmdFail)
+						if err := cb.Send(context.Background(), cmdFail); err != nil {
+							log.Printf("Failed to send failing command: %v\n", err)
+						}
 
 						exec, err = cb.Wait(context.Background(), cmdFail.CommandID(), 5*time.Second)
 						if err != nil {
