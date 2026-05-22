@@ -57,26 +57,52 @@ type CommandBusConfig struct {
 	WaitTimeout time.Duration
 	// WaitTickerInterval is the interval between checks for command status in the Wait method.
 	WaitTickerInterval time.Duration
+	// UseSQLQueue indicates if we should queue commands directly in the database table.
+	UseSQLQueue bool
 }
 
 type commandBus struct {
 	bus       *cqrs.CommandBus
 	execStore CommandExecutionStore
+	marshaler cqrs.CommandEventMarshaler
 	config    CommandBusConfig
 }
 
-func NewCommandBus(bus *cqrs.CommandBus, execStore CommandExecutionStore, config CommandBusConfig) CommandBus {
+func NewCommandBus(
+	bus *cqrs.CommandBus,
+	execStore CommandExecutionStore,
+	marshaler cqrs.CommandEventMarshaler,
+	config CommandBusConfig,
+) CommandBus {
 	if config.WaitTickerInterval == 0 {
 		config.WaitTickerInterval = 200 * time.Millisecond
 	}
 	return &commandBus{
 		bus:       bus,
 		execStore: execStore,
+		marshaler: marshaler,
 		config:    config,
 	}
 }
 
 func (b *commandBus) Send(ctx context.Context, cmd Command) error {
+	if b.config.UseSQLQueue {
+		if b.execStore == nil {
+			return errors.New("command execution store not configured for SQL queueing")
+		}
+		if b.marshaler == nil {
+			return errors.New("marshaler not configured for SQL queueing")
+		}
+
+		msg, err := b.marshaler.Marshal(cmd)
+		if err != nil {
+			return fmt.Errorf("failed to marshal command for SQL queue: %w", err)
+		}
+
+		commandName := b.marshaler.Name(cmd)
+		return b.execStore.RecordPending(ctx, nil, cmd.CommandID(), commandName, msg.Payload)
+	}
+
 	return b.bus.Send(ctx, cmd)
 }
 

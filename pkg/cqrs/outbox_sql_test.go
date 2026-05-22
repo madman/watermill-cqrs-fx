@@ -34,7 +34,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 
 func TestSQLOutbox_Save(t *testing.T) {
 	db := setupTestDB(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	outbox := NewSQLOutbox(db, "outbox")
 	tm := NewSQLTransactionManager(db)
@@ -61,7 +61,7 @@ func TestSQLOutbox_Save(t *testing.T) {
 
 func TestSQLTransactionManager_Rollback(t *testing.T) {
 	db := setupTestDB(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	outbox := NewSQLOutbox(db, "outbox")
 	tm := NewSQLTransactionManager(db)

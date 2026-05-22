@@ -16,6 +16,8 @@ const (
 type CommandExecution struct {
 	CommandID   string
 	HandlerName string
+	CommandName string
+	Payload     []byte
 	Status      CommandExecutionStatus
 	ErrorData   []byte // JSON serialized CommandError
 	StartedAt   time.Time
@@ -23,9 +25,11 @@ type CommandExecution struct {
 }
 
 type CommandExecutionStore interface {
+	RecordPending(ctx context.Context, tx Tx, commandID string, commandName string, payload []byte) error
 	RecordStarted(ctx context.Context, tx Tx, commandID string, handlerName string) error
 	RecordSuccess(ctx context.Context, tx Tx, commandID string) error
 	RecordFailure(ctx context.Context, tx Tx, commandID string, errorData []byte) error
 	GetStatus(ctx context.Context, tx Tx, commandID string) (CommandExecutionStatus, error)
 	GetExecution(ctx context.Context, tx Tx, commandID string) (*CommandExecution, error)
+	GetNextPending(ctx context.Context, tx Tx) (*CommandExecution, error)
 }
