@@ -19,6 +19,10 @@ func NewSQLOutbox(db *sql.DB, table string) *SQLOutbox {
 	}
 }
 
+func (o *SQLOutbox) TableName() string {
+	return o.table
+}
+
 func (o *SQLOutbox) Save(ctx context.Context, tx Tx, records ...OutboxRecord) error {
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, topic, payload, metadata, occurred_at)
@@ -48,8 +52,15 @@ func NewSQLTransactionManager(db *sql.DB) *SQLTransactionManager {
 	return &SQLTransactionManager{db: db}
 }
 
+func (m *SQLTransactionManager) AfterCommit(ctx context.Context, fn func()) {
+	RegisterAfterCommit(ctx, fn)
+}
+
 func (m *SQLTransactionManager) WithinTransaction(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
-	tx, err := m.db.BeginTx(ctx, nil)
+	hooks := &txHooks{}
+	ctxWithHooks := context.WithValue(ctx, txHooksKey{}, hooks)
+
+	tx, err := m.db.BeginTx(ctxWithHooks, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -61,7 +72,7 @@ func (m *SQLTransactionManager) WithinTransaction(ctx context.Context, fn func(c
 		}
 	}()
 
-	if err := fn(ctx, tx); err != nil {
+	if err := fn(ctxWithHooks, tx); err != nil {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
 			return fmt.Errorf("error: %v, rollback error: %v", err, rollbackErr)
 		}
@@ -70,6 +81,10 @@ func (m *SQLTransactionManager) WithinTransaction(ctx context.Context, fn func(c
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	for _, cb := range hooks.afterCommit {
+		cb()
 	}
 
 	return nil

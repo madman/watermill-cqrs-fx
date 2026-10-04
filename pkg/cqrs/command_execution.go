@@ -32,4 +32,10 @@ type CommandExecutionStore interface {
 	GetStatus(ctx context.Context, tx Tx, commandID string) (CommandExecutionStatus, error)
 	GetExecution(ctx context.Context, tx Tx, commandID string) (*CommandExecution, error)
 	GetNextPending(ctx context.Context, tx Tx) (*CommandExecution, error)
+	CountPending(ctx context.Context, tx Tx) (int, error)
+}
+
+// DialectAware is an optional interface implemented by stores that expose their database dialect.
+type DialectAware interface {
+	Dialect() Dialect
 }

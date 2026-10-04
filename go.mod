@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/ThreeDotsLabs/watermill v1.5.1
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/madman/cmderr v0.1.0
 	github.com/stretchr/testify v1.11.1
@@ -12,6 +13,7 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect

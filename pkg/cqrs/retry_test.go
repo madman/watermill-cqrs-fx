@@ -31,6 +31,10 @@ func (m *retryMockTxManager) WithinTransaction(ctx context.Context, fn func(ctx 
 	return fn(ctx, &retryMockTx{})
 }
 
+func (m *retryMockTxManager) AfterCommit(ctx context.Context, fn func()) {
+	RegisterAfterCommit(ctx, fn)
+}
+
 type retryMockTx struct {
 	Tx
 }
@@ -65,6 +69,10 @@ func (m *retryMockExecStore) GetNextPending(ctx context.Context, tx Tx) (*Comman
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*CommandExecution), args.Error(1)
+}
+func (m *retryMockExecStore) CountPending(ctx context.Context, tx Tx) (int, error) {
+	args := m.Called(ctx, tx)
+	return args.Int(0), args.Error(1)
 }
 
 func TestTransactionalCommandHandler_RetryPrevention(t *testing.T) {

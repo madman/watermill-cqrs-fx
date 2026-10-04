@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
@@ -51,6 +52,51 @@ func (h *genericCommandHandler[C, T]) Handle(ctx context.Context, tx Tx, cmd any
 	return h.handler(ctx, t, cmd.(*C))
 }
 
+// ErrQueueFull is returned by CommandBus.Send when pending commands reach or exceed MaxPending.
+var ErrQueueFull = errors.New("command queue is full")
+
+// SQLQueueConfig defines the configuration for SQL-backed command queueing and workers.
+type SQLQueueConfig struct {
+	// PollInterval is the fallback polling interval. 0 -> default (30s), <0 -> disabled.
+	PollInterval time.Duration
+	// Notifier is the wake-up signal source. nil -> NewChannelNotifier().
+	Notifier Notifier
+	// DisableWakeup disables wake-up signaling (pure polling mode).
+	DisableWakeup bool
+	// Concurrency is the number of worker goroutines. 0 -> default (1).
+	Concurrency int
+	// MaxPending is the backpressure limit for pending commands. 0 -> default (1000), <0 -> unlimited.
+	MaxPending int
+	// PendingCountCacheTTL is the TTL for caching COUNT(*) pending commands. 0 -> default (1s), <0 -> disabled.
+	PendingCountCacheTTL time.Duration
+	// ErrorBackoff is the pause after a database error in the worker. 0 -> default (1s), <0 -> disabled.
+	ErrorBackoff time.Duration
+	// Dialect optionally specifies or overrides the database dialect.
+	Dialect Dialect
+}
+
+// Normalize applies default values for zero fields while preserving negative values as disabled.
+func (cfg *SQLQueueConfig) Normalize() {
+	if cfg.PollInterval == 0 {
+		cfg.PollInterval = 30 * time.Second
+	}
+	if cfg.Notifier == nil {
+		cfg.Notifier = NewChannelNotifier()
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.MaxPending == 0 {
+		cfg.MaxPending = 1000
+	}
+	if cfg.PendingCountCacheTTL == 0 {
+		cfg.PendingCountCacheTTL = 1 * time.Second
+	}
+	if cfg.ErrorBackoff == 0 {
+		cfg.ErrorBackoff = 1 * time.Second
+	}
+}
+
 // CommandBusConfig defines the configuration for the command bus.
 type CommandBusConfig struct {
 	// WaitTimeout is the default timeout for the Wait method.
@@ -59,13 +105,22 @@ type CommandBusConfig struct {
 	WaitTickerInterval time.Duration
 	// UseSQLQueue indicates if we should queue commands directly in the database table.
 	UseSQLQueue bool
+	// SQLQueue contains options for SQL command queueing and worker behavior.
+	SQLQueue SQLQueueConfig
 }
 
 type commandBus struct {
-	bus       *cqrs.CommandBus
-	execStore CommandExecutionStore
-	marshaler cqrs.CommandEventMarshaler
-	config    CommandBusConfig
+	bus               *cqrs.CommandBus
+	execStore         CommandExecutionStore
+	marshaler         cqrs.CommandEventMarshaler
+	config            CommandBusConfig
+	pendingCountCache pendingCountCache
+}
+
+type pendingCountCache struct {
+	mu       sync.Mutex
+	count    int
+	cachedAt time.Time
 }
 
 func NewCommandBus(
@@ -77,12 +132,47 @@ func NewCommandBus(
 	if config.WaitTickerInterval == 0 {
 		config.WaitTickerInterval = 200 * time.Millisecond
 	}
+	config.SQLQueue.Normalize()
 	return &commandBus{
 		bus:       bus,
 		execStore: execStore,
 		marshaler: marshaler,
 		config:    config,
 	}
+}
+
+func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
+	if b.config.SQLQueue.MaxPending <= 0 {
+		return nil
+	}
+
+	b.pendingCountCache.mu.Lock()
+	now := time.Now()
+	ttl := b.config.SQLQueue.PendingCountCacheTTL
+	if ttl > 0 && !b.pendingCountCache.cachedAt.IsZero() && now.Sub(b.pendingCountCache.cachedAt) < ttl {
+		count := b.pendingCountCache.count
+		b.pendingCountCache.mu.Unlock()
+		if count >= b.config.SQLQueue.MaxPending {
+			return ErrQueueFull
+		}
+		return nil
+	}
+	b.pendingCountCache.mu.Unlock()
+
+	count, err := b.execStore.CountPending(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to count pending commands: %w", err)
+	}
+
+	b.pendingCountCache.mu.Lock()
+	b.pendingCountCache.count = count
+	b.pendingCountCache.cachedAt = now
+	b.pendingCountCache.mu.Unlock()
+
+	if count >= b.config.SQLQueue.MaxPending {
+		return ErrQueueFull
+	}
+	return nil
 }
 
 func (b *commandBus) Send(ctx context.Context, cmd Command) error {
@@ -94,13 +184,29 @@ func (b *commandBus) Send(ctx context.Context, cmd Command) error {
 			return errors.New("marshaler not configured for SQL queueing")
 		}
 
+		if err := b.checkQueueCapacity(ctx); err != nil {
+			return err
+		}
+
 		msg, err := b.marshaler.Marshal(cmd)
 		if err != nil {
 			return fmt.Errorf("failed to marshal command for SQL queue: %w", err)
 		}
 
 		commandName := b.marshaler.Name(cmd)
-		return b.execStore.RecordPending(ctx, nil, cmd.CommandID(), commandName, msg.Payload)
+		if err := b.execStore.RecordPending(ctx, nil, cmd.CommandID(), commandName, msg.Payload); err != nil {
+			return err
+		}
+
+		b.pendingCountCache.mu.Lock()
+		b.pendingCountCache.count++
+		b.pendingCountCache.mu.Unlock()
+
+		if !b.config.SQLQueue.DisableWakeup && b.config.SQLQueue.Notifier != nil {
+			b.config.SQLQueue.Notifier.Notify()
+		}
+
+		return nil
 	}
 
 	return b.bus.Send(ctx, cmd)

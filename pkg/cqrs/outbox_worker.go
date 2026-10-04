@@ -12,30 +12,78 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 )
 
-type SQLOutboxWorker struct {
-	db           *sql.DB
-	tableName    string
-	publisher    message.Publisher
-	logger       watermill.LoggerAdapter
-	pollInterval time.Duration
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
+// SQLOutboxWorkerConfig defines the configuration for the SQL outbox worker.
+type SQLOutboxWorkerConfig struct {
+	// TableName is the outbox database table name. "" -> default ("events").
+	TableName string
+	// PollInterval is the fallback polling interval. 0 -> default (30s), <0 -> disabled.
+	PollInterval time.Duration
+	// BatchSize is the batch size for querying outbox records. 0 -> default (50).
+	BatchSize int
+	// Notifier is the wake-up signal source. nil -> NewChannelNotifier().
+	Notifier Notifier
+	// ErrorBackoff is the pause after a database error in the worker. 0 -> default (1s), <0 -> disabled.
+	ErrorBackoff time.Duration
 }
 
+// Normalize sets default values for zero fields while preserving negative values as disabled.
+func (cfg *SQLOutboxWorkerConfig) Normalize() {
+	if cfg.TableName == "" {
+		cfg.TableName = "events"
+	}
+	if cfg.PollInterval == 0 {
+		cfg.PollInterval = 30 * time.Second
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 50
+	}
+	if cfg.Notifier == nil {
+		cfg.Notifier = NewChannelNotifier()
+	}
+	if cfg.ErrorBackoff == 0 {
+		cfg.ErrorBackoff = 1 * time.Second
+	}
+}
+
+type SQLOutboxWorker struct {
+	db        *sql.DB
+	publisher message.Publisher
+	logger    watermill.LoggerAdapter
+	config    SQLOutboxWorkerConfig
+	stopChan  chan struct{}
+	wg        sync.WaitGroup
+}
+
+// NewSQLOutboxWorkerWithConfig creates a new SQLOutboxWorker with parameterized configuration.
+func NewSQLOutboxWorkerWithConfig(
+	db *sql.DB,
+	publisher message.Publisher,
+	logger watermill.LoggerAdapter,
+	cfg SQLOutboxWorkerConfig,
+) *SQLOutboxWorker {
+	cfg.Normalize()
+	return &SQLOutboxWorker{
+		db:        db,
+		publisher: publisher,
+		logger:    logger,
+		config:    cfg,
+		stopChan:  make(chan struct{}),
+	}
+}
+
+// NewSQLOutboxWorker creates a new SQLOutboxWorker with default configuration and custom table name.
 func NewSQLOutboxWorker(
 	db *sql.DB,
 	tableName string,
 	publisher message.Publisher,
 	logger watermill.LoggerAdapter,
 ) *SQLOutboxWorker {
-	return &SQLOutboxWorker{
-		db:           db,
-		tableName:    tableName,
-		publisher:    publisher,
-		logger:       logger,
-		pollInterval: 100 * time.Millisecond,
-		stopChan:     make(chan struct{}),
-	}
+	return NewSQLOutboxWorkerWithConfig(
+		db,
+		publisher,
+		logger,
+		SQLOutboxWorkerConfig{TableName: tableName},
+	)
 }
 
 func (w *SQLOutboxWorker) Start(ctx context.Context) error {
@@ -43,11 +91,25 @@ func (w *SQLOutboxWorker) Start(ctx context.Context) error {
 	go func() {
 		defer w.wg.Done()
 		w.logger.Info("Starting SQL Outbox Worker", watermill.LogFields{
-			"table": w.tableName,
+			"table":         w.config.TableName,
+			"poll_interval": w.config.PollInterval.String(),
+			"batch_size":    w.config.BatchSize,
 		})
 
-		ticker := time.NewTicker(w.pollInterval)
-		defer ticker.Stop()
+		// Immediate recovery drain on startup
+		w.drain(ctx)
+
+		var tickerChan <-chan time.Time
+		if w.config.PollInterval > 0 {
+			ticker := time.NewTicker(w.config.PollInterval)
+			defer ticker.Stop()
+			tickerChan = ticker.C
+		}
+
+		var notifierChan <-chan struct{}
+		if w.config.Notifier != nil {
+			notifierChan = w.config.Notifier.C()
+		}
 
 		for {
 			select {
@@ -57,14 +119,45 @@ func (w *SQLOutboxWorker) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				w.logger.Info("SQL Outbox Worker context cancelled, stopping", nil)
 				return
-			case <-ticker.C:
-				if err := w.processOutbox(ctx); err != nil {
-					w.logger.Error("Failed to process outbox records", err, nil)
-				}
+			case <-tickerChan:
+				w.drain(ctx)
+			case <-notifierChan:
+				w.drain(ctx)
 			}
 		}
 	}()
 	return nil
+}
+
+func (w *SQLOutboxWorker) drain(ctx context.Context) {
+	for {
+		select {
+		case <-w.stopChan:
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		count, err := w.processBatch(ctx)
+		if err != nil {
+			w.logger.Error("Failed to process outbox records", err, nil)
+			if w.config.ErrorBackoff > 0 {
+				select {
+				case <-w.stopChan:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(w.config.ErrorBackoff):
+				}
+			}
+			break
+		}
+
+		if count < w.config.BatchSize {
+			break
+		}
+	}
 }
 
 func (w *SQLOutboxWorker) Stop() error {
@@ -73,15 +166,14 @@ func (w *SQLOutboxWorker) Stop() error {
 	return nil
 }
 
-func (w *SQLOutboxWorker) processOutbox(ctx context.Context) error {
-	// Query next batch of unpublished outbox records
+func (w *SQLOutboxWorker) processBatch(ctx context.Context) (int, error) {
 	query := fmt.Sprintf(`
-		SELECT id, topic, payload, metadata FROM %s ORDER BY occurred_at ASC LIMIT 50
-	`, w.tableName)
+		SELECT id, topic, payload, metadata FROM %s ORDER BY occurred_at ASC LIMIT %d
+	`, w.config.TableName, w.config.BatchSize)
 
 	rows, err := w.db.QueryContext(ctx, query)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -96,14 +188,17 @@ func (w *SQLOutboxWorker) processOutbox(ctx context.Context) error {
 	for rows.Next() {
 		var r record
 		if err := rows.Scan(&r.id, &r.topic, &r.payload, &r.metadata); err != nil {
-			return err
+			return 0, err
 		}
 		records = append(records, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
 	}
 	_ = rows.Close()
 
 	if len(records) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	w.logger.Debug("Processing outbox events batch", watermill.LogFields{
@@ -122,16 +217,16 @@ func (w *SQLOutboxWorker) processOutbox(ctx context.Context) error {
 
 		// Publish to the real Watermill publisher (e.g. GoChannel, RabbitMQ)
 		if err := w.publisher.Publish(r.topic, msg); err != nil {
-			return fmt.Errorf("failed to publish outbox event %s to topic %s: %w", r.id, r.topic, err)
+			return 0, fmt.Errorf("failed to publish outbox event %s to topic %s: %w", r.id, r.topic, err)
 		}
 
 		// Delete upon successful publication
-		deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE id = ?", w.tableName)
+		deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE id = ?", w.config.TableName)
 		_, err = w.db.ExecContext(ctx, deleteQuery, r.id)
 		if err != nil {
-			return fmt.Errorf("failed to delete outbox record %s: %w", r.id, err)
+			return 0, fmt.Errorf("failed to delete outbox record %s: %w", r.id, err)
 		}
 	}
 
-	return nil
+	return len(records), nil
 }

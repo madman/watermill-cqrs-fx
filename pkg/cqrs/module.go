@@ -14,6 +14,15 @@ import (
 
 var Module = fx.Module("cqrs",
 	fx.Provide(
+		// Provide default in-process notifiers
+		fx.Annotate(
+			NewChannelNotifier,
+			fx.ResultTags(`name:"command_notifier"`),
+		),
+		fx.Annotate(
+			NewChannelNotifier,
+			fx.ResultTags(`name:"outbox_notifier"`),
+		),
 		// Provide the default marshaler
 		func() cqrs.CommandEventMarshaler {
 			return cqrs.JSONMarshaler{}
@@ -51,14 +60,31 @@ var Module = fx.Module("cqrs",
 		// Provide our wrapper buses
 		func(params struct {
 			fx.In
-			Bus       *cqrs.CommandBus
-			ExecStore CommandExecutionStore      `optional:"true"`
-			Marshaler cqrs.CommandEventMarshaler `optional:"true"`
-			Config    CommandBusConfig           `optional:"true"`
+			Bus             *cqrs.CommandBus
+			ExecStore       CommandExecutionStore      `optional:"true"`
+			Marshaler       cqrs.CommandEventMarshaler `optional:"true"`
+			Config          CommandBusConfig           `optional:"true"`
+			CommandNotifier Notifier                   `name:"command_notifier" optional:"true"`
 		}) CommandBus {
-			return NewCommandBus(params.Bus, params.ExecStore, params.Marshaler, params.Config)
+			cfg := params.Config
+			if cfg.SQLQueue.Notifier == nil && params.CommandNotifier != nil {
+				cfg.SQLQueue.Notifier = params.CommandNotifier
+			}
+			return NewCommandBus(params.Bus, params.ExecStore, params.Marshaler, cfg)
 		},
-		NewEventBus,
+		func(params struct {
+			fx.In
+			Bus            *cqrs.EventBus
+			Marshaler      cqrs.CommandEventMarshaler `optional:"true"`
+			Outbox         Outbox                     `optional:"true"`
+			TxManager      TransactionManager         `optional:"true"`
+			OutboxNotifier Notifier                   `name:"outbox_notifier" optional:"true"`
+		}) EventBus {
+			return NewEventBusWithConfig(params.Bus, params.Marshaler, params.Outbox, EventBusConfig{
+				TxManager:      params.TxManager,
+				OutboxNotifier: params.OutboxNotifier,
+			})
+		},
 		// Provide QueryBus
 		func(params struct {
 			fx.In
@@ -283,17 +309,20 @@ func NewEventProcessor(params ProcessorParams) (*cqrs.EventProcessor, error) {
 
 func RunSQLWorkers(
 	lc fx.Lifecycle,
-	db *sql.DB,
-	execStore CommandExecutionStore,
-	txManager TransactionManager,
-	marshaler cqrs.CommandEventMarshaler,
-	publisher message.Publisher,
 	logger watermill.LoggerAdapter,
 	params struct {
 		fx.In
-		Config          CommandBusConfig `optional:"true"`
-		CommandHandlers []any            `group:"command_handlers"`
-		Outbox          Outbox           `optional:"true"`
+		Db              *sql.DB                    `optional:"true"`
+		ExecStore       CommandExecutionStore      `optional:"true"`
+		TxManager       TransactionManager         `optional:"true"`
+		Marshaler       cqrs.CommandEventMarshaler `optional:"true"`
+		Publisher       message.Publisher          `optional:"true"`
+		Config          CommandBusConfig           `optional:"true"`
+		OutboxConfig    SQLOutboxWorkerConfig      `optional:"true"`
+		CommandHandlers []any                      `group:"command_handlers"`
+		Outbox          Outbox                     `optional:"true"`
+		CommandNotifier Notifier                   `name:"command_notifier" optional:"true"`
+		OutboxNotifier  Notifier                   `name:"outbox_notifier" optional:"true"`
 	},
 ) {
 	var queueWorker *SQLCommandQueueWorker
@@ -301,8 +330,44 @@ func RunSQLWorkers(
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
+			commandNotifier := params.Config.SQLQueue.Notifier
+			if commandNotifier == nil {
+				commandNotifier = params.CommandNotifier
+			}
+			if commandNotifier == nil {
+				commandNotifier = NewChannelNotifier()
+			}
+
+			outboxNotifier := params.OutboxConfig.Notifier
+			if outboxNotifier == nil {
+				outboxNotifier = params.OutboxNotifier
+			}
+			if outboxNotifier == nil {
+				outboxNotifier = NewChannelNotifier()
+			}
+
 			if params.Config.UseSQLQueue {
-				qw, err := NewSQLCommandQueueWorker(execStore, txManager, marshaler, logger, params.CommandHandlers)
+				if params.ExecStore == nil {
+					return errors.New("command execution store is required for SQL queue worker")
+				}
+				if params.TxManager == nil {
+					return errors.New("transaction manager is required for SQL queue worker")
+				}
+				if params.Marshaler == nil {
+					return errors.New("marshaler is required for SQL queue worker")
+				}
+
+				queueCfg := params.Config.SQLQueue
+				queueCfg.Notifier = commandNotifier
+				qw, err := NewSQLCommandQueueWorkerWithConfig(
+					params.ExecStore,
+					params.TxManager,
+					params.Marshaler,
+					logger,
+					params.CommandHandlers,
+					queueCfg,
+					outboxNotifier,
+				)
 				if err != nil {
 					return err
 				}
@@ -313,8 +378,21 @@ func RunSQLWorkers(
 			}
 
 			if params.Outbox != nil {
-				tableName := "events"
-				ow := NewSQLOutboxWorker(db, tableName, publisher, logger)
+				if params.Db == nil {
+					return errors.New("database connection is required for SQL outbox worker")
+				}
+				if params.Publisher == nil {
+					return errors.New("message publisher is required for SQL outbox worker")
+				}
+
+				outboxCfg := params.OutboxConfig
+				outboxCfg.Notifier = outboxNotifier
+				if outboxCfg.TableName == "" {
+					if tn, ok := params.Outbox.(TableNamer); ok && tn.TableName() != "" {
+						outboxCfg.TableName = tn.TableName()
+					}
+				}
+				ow := NewSQLOutboxWorkerWithConfig(params.Db, params.Publisher, logger, outboxCfg)
 				if err := ow.Start(context.Background()); err != nil {
 					return err
 				}

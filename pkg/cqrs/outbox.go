@@ -19,9 +19,17 @@ type Outbox interface {
 	Save(ctx context.Context, tx Tx, records ...OutboxRecord) error
 }
 
+// TableNamer is an optional interface implemented by Outbox stores that know their table name.
+type TableNamer interface {
+	TableName() string
+}
+
 // TransactionManager defines the interface for running code within a database transaction.
 type TransactionManager interface {
 	// WithinTransaction executes the given function within a transaction.
 	// If the function returns an error, the transaction is rolled back.
 	WithinTransaction(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error
+
+	// AfterCommit registers a callback to be executed after the current transaction commits successfully.
+	AfterCommit(ctx context.Context, fn func())
 }
