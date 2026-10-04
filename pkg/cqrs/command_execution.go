@@ -32,6 +32,10 @@ type CommandExecutionStore interface {
 	GetStatus(ctx context.Context, tx Tx, commandID string) (CommandExecutionStatus, error)
 	GetExecution(ctx context.Context, tx Tx, commandID string) (*CommandExecution, error)
 	GetNextPending(ctx context.Context, tx Tx) (*CommandExecution, error)
+}
+
+// PendingCounter is an optional interface implemented by stores that can count pending commands for backpressure.
+type PendingCounter interface {
 	CountPending(ctx context.Context, tx Tx) (int, error)
 }
 

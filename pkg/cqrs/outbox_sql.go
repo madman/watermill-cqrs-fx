@@ -52,8 +52,8 @@ func NewSQLTransactionManager(db *sql.DB) *SQLTransactionManager {
 	return &SQLTransactionManager{db: db}
 }
 
-func (m *SQLTransactionManager) AfterCommit(ctx context.Context, fn func()) {
-	RegisterAfterCommit(ctx, fn)
+func (m *SQLTransactionManager) AfterCommit(ctx context.Context, fn func()) bool {
+	return RegisterAfterCommit(ctx, fn)
 }
 
 func (m *SQLTransactionManager) WithinTransaction(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {

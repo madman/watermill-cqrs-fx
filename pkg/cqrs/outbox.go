@@ -29,7 +29,10 @@ type TransactionManager interface {
 	// WithinTransaction executes the given function within a transaction.
 	// If the function returns an error, the transaction is rolled back.
 	WithinTransaction(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error
+}
 
-	// AfterCommit registers a callback to be executed after the current transaction commits successfully.
-	AfterCommit(ctx context.Context, fn func())
+// AfterCommitter is an optional interface implemented by transaction managers
+// that support registering callbacks to execute after transaction commit.
+type AfterCommitter interface {
+	AfterCommit(ctx context.Context, fn func()) bool
 }

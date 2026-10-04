@@ -83,9 +83,6 @@ func (cfg *SQLQueueConfig) Normalize() {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 30 * time.Second
 	}
-	if cfg.Notifier == nil {
-		cfg.Notifier = NewChannelNotifier()
-	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 1
 	}
@@ -137,6 +134,9 @@ func NewCommandBus(
 		config.WaitTickerInterval = 200 * time.Millisecond
 	}
 	config.SQLQueue.Normalize()
+	if config.UseSQLQueue && config.SQLQueue.Notifier == nil && !config.SQLQueue.DisableWakeup {
+		config.SQLQueue.Notifier = NewChannelNotifier()
+	}
 	return &commandBus{
 		bus:       bus,
 		execStore: execStore,
@@ -145,8 +145,19 @@ func NewCommandBus(
 	}
 }
 
+// Notifier returns the wake-up Notifier used by this bus if SQL queueing is enabled.
+func (b *commandBus) Notifier() Notifier {
+	return b.config.SQLQueue.Notifier
+}
+
 func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
 	if b.config.SQLQueue.MaxPending <= 0 {
+		return nil
+	}
+
+	counter, ok := b.execStore.(PendingCounter)
+	if !ok {
+		// If store does not implement PendingCounter, bypass MaxPending backpressure gracefully.
 		return nil
 	}
 
@@ -174,7 +185,7 @@ func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
 		}
 		b.pendingCountCache.mu.Unlock()
 
-		count, err := b.execStore.CountPending(ctx, nil)
+		count, err := counter.CountPending(ctx, nil)
 		if err != nil {
 			return 0, fmt.Errorf("failed to count pending commands: %w", err)
 		}

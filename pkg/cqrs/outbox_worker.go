@@ -37,9 +37,6 @@ func (cfg *SQLOutboxWorkerConfig) Normalize() {
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 50
 	}
-	if cfg.Notifier == nil {
-		cfg.Notifier = NewChannelNotifier()
-	}
 	if cfg.ErrorBackoff == 0 {
 		cfg.ErrorBackoff = 1 * time.Second
 	}
@@ -167,6 +164,11 @@ func (w *SQLOutboxWorker) Stop() error {
 	})
 	w.wg.Wait()
 	return nil
+}
+
+// Notifier returns the wake-up Notifier configured for this outbox worker, or nil if none.
+func (w *SQLOutboxWorker) Notifier() Notifier {
+	return w.config.Notifier
 }
 
 func (w *SQLOutboxWorker) processBatch(ctx context.Context) (int, error) {

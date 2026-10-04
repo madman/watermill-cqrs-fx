@@ -367,9 +367,6 @@ func (s *failingExecStore) GetNextPending(context.Context, Tx) (*CommandExecutio
 	s.callCount.Add(1)
 	return nil, s.err
 }
-func (s *failingExecStore) CountPending(context.Context, Tx) (int, error) {
-	return 0, s.err
-}
 
 func TestSQLCommandQueueWorker_DoubleStop_NoPanic(t *testing.T) {
 	db, store, tm := setupCommandQueueTestDB(t)
@@ -432,4 +429,68 @@ func TestCommandBus_CheckQueueCapacity_Singleflight(t *testing.T) {
 
 	// With singleflight, concurrent calls to CountPending should be deduplicated to 1 call
 	assert.Equal(t, int64(1), store.countCalls.Load(), "concurrent CountPending calls should be deduplicated by singleflight")
+}
+
+func TestCommandBus_StoreWithoutPendingCounter_BypassesLimit(t *testing.T) {
+	// failingExecStore implements CommandExecutionStore but does NOT implement PendingCounter
+	store := &failingExecStore{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			MaxPending: 1, // should be bypassed because store lacks PendingCounter
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	// checkQueueCapacity should return nil without failing
+	cb := bus.(*commandBus)
+	err := cb.checkQueueCapacity(context.Background())
+	assert.NoError(t, err)
+}
+
+func TestSQLCommandQueueWorkerWithBus_SharesNotifier(t *testing.T) {
+	db, store, tm := setupCommandQueueTestDB(t)
+	defer func() { _ = db.Close() }()
+
+	logger := watermill.NopLogger{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			PollInterval: 1 * time.Hour, // long polling interval to prove wake-up handles it
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	received := make(chan string, 1)
+	handler := NewCommandHandler("busHandler", func(ctx context.Context, tx Tx, cmd *testCmd) error {
+		received <- cmd.Data
+		return nil
+	})
+
+	worker, err := NewSQLCommandQueueWorkerWithBus(store, tm, marshaler, logger, []any{handler}, bus)
+	require.NoError(t, err)
+
+	// Verify notifier is shared between bus and worker
+	busNotifier := bus.(NotifierProvider).Notifier()
+	require.NotNil(t, busNotifier)
+	assert.Equal(t, busNotifier, worker.Notifier())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, worker.Start(ctx))
+	defer func() { _ = worker.Stop() }()
+
+	cmd := &testCmd{BaseCommand: NewBaseCommand(), Data: "wake-up-from-bus"}
+	require.NoError(t, bus.Send(ctx, cmd))
+
+	select {
+	case data := <-received:
+		assert.Equal(t, "wake-up-from-bus", data)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("worker was not woken up by bus Send signal")
+	}
 }

@@ -78,11 +78,16 @@ var Module = fx.Module("cqrs",
 			Marshaler      cqrs.CommandEventMarshaler `optional:"true"`
 			Outbox         Outbox                     `optional:"true"`
 			TxManager      TransactionManager         `optional:"true"`
+			OutboxConfig   SQLOutboxWorkerConfig      `optional:"true"`
 			OutboxNotifier Notifier                   `name:"outbox_notifier" optional:"true"`
 		}) EventBus {
+			outboxNotifier := params.OutboxConfig.Notifier
+			if outboxNotifier == nil {
+				outboxNotifier = params.OutboxNotifier
+			}
 			return NewEventBusWithConfig(params.Bus, params.Marshaler, params.Outbox, EventBusConfig{
 				TxManager:      params.TxManager,
-				OutboxNotifier: params.OutboxNotifier,
+				OutboxNotifier: outboxNotifier,
 			})
 		},
 		// Provide QueryBus

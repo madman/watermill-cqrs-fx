@@ -88,6 +88,30 @@ func NewSQLCommandQueueWorker(
 	)
 }
 
+// NewSQLCommandQueueWorkerWithBus creates a new SQLCommandQueueWorker reusing the wake-up Notifier from the given CommandBus.
+func NewSQLCommandQueueWorkerWithBus(
+	execStore CommandExecutionStore,
+	txManager TransactionManager,
+	marshaler watermill_cqrs.CommandEventMarshaler,
+	logger watermill.LoggerAdapter,
+	rawHandlers []any,
+	bus CommandBus,
+) (*SQLCommandQueueWorker, error) {
+	var notifier Notifier
+	if np, ok := bus.(NotifierProvider); ok {
+		notifier = np.Notifier()
+	}
+	return NewSQLCommandQueueWorkerWithConfig(
+		execStore,
+		txManager,
+		marshaler,
+		logger,
+		rawHandlers,
+		SQLQueueConfig{Notifier: notifier},
+		nil,
+	)
+}
+
 func (w *SQLCommandQueueWorker) Start(ctx context.Context) error {
 	w.logger.Info("Starting SQL Command Queue Worker", watermill.LogFields{
 		"registered_handlers": len(w.handlers),
@@ -181,6 +205,11 @@ func (w *SQLCommandQueueWorker) Stop() error {
 	})
 	w.wg.Wait()
 	return nil
+}
+
+// Notifier returns the wake-up Notifier configured for this queue worker, or nil if none.
+func (w *SQLCommandQueueWorker) Notifier() Notifier {
+	return w.config.Notifier
 }
 
 func (w *SQLCommandQueueWorker) processNext(ctx context.Context) (bool, error) {

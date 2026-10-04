@@ -208,6 +208,21 @@ func TestEventBus_AfterCommitNotificationAndRollback(t *testing.T) {
 	default:
 		// Clean, no wake-up signal
 	}
+
+	// 3. Manual transaction outside WithinTransaction: Publish MUST fire outboxNotifier immediately as fallback
+	manualTx, err := db.Begin()
+	require.NoError(t, err)
+	defer func() { _ = manualTx.Rollback() }()
+
+	err = eb.Publish(context.Background(), manualTx, testEvent{Greeting: "Manual Tx"})
+	require.NoError(t, err)
+
+	select {
+	case <-outboxNotifier.C():
+		// Correct: fallback immediate wake-up fired
+	default:
+		t.Fatal("expected outboxNotifier to fire immediately for transaction outside WithinTransaction")
+	}
 }
 
 func TestSQLOutboxWorker_DrainBatchLoop(t *testing.T) {
