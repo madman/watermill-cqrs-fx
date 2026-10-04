@@ -133,14 +133,15 @@ Ensure the `command_executions` and `events` (Outbox) tables have the required c
 ```sql
 -- Command Executions Queue
 CREATE TABLE command_executions (
-    id VARCHAR(255) PRIMARY KEY,
-    handler_name VARCHAR(255) NOT NULL,
-    status VARCHAR(50) NOT NULL,
-    error_payload TEXT,
-    command_name VARCHAR(255) DEFAULT '',
+    command_id VARCHAR(255) PRIMARY KEY,
+    handler_name VARCHAR(255) NOT NULL DEFAULT '',
+    command_name VARCHAR(255) NOT NULL DEFAULT '',
     payload LONGBLOB,
-    started_at TIMESTAMP NULL,
-    finished_at TIMESTAMP NULL
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    error_data LONGBLOB,
+    started_at DATETIME NOT NULL,
+    finished_at DATETIME,
+    INDEX idx_status_started_at (status, started_at)
 );
 
 -- Outbox Events
@@ -149,11 +150,45 @@ CREATE TABLE events (
     topic VARCHAR(255) NOT NULL,
     payload LONGBLOB NOT NULL,
     metadata TEXT NOT NULL,
-    occurred_at TIMESTAMP NOT NULL
+    occurred_at DATETIME NOT NULL
 );
 ```
 
-### 2. Configuration
+> **Recommendation**: Always include `INDEX (status, started_at)` on `command_executions` for high-throughput `GetNextPending` queries (`SKIP LOCKED`) and fast `COUNT(*)` pending checks.
+
+### 2. Hybrid In-Process Wake-Up & Worker Configuration
+
+Instead of aggressive constant database polling (10-20 queries/s at idle), workers use an **in-process wake-up signal** (`Notifier`) combined with a relaxed fallback polling interval (default 30s) for recovery and cross-instance safety:
+
+- **Command Queue**: `CommandBus.Send()` records the command to SQL and immediately calls `Notifier.Notify()`, waking the worker with sub-millisecond latency.
+- **Outbox Worker**: `SQLCommandQueueWorker` wakes `outboxNotifier` after committing a command transaction. For external transactions, `EventBus.Publish` registers an after-commit hook with `TransactionManager` that fires upon successful commit.
+- **Backpressure**: When `pending` commands exceed `MaxPending` (default 1000), `Send()` immediately returns `ErrQueueFull` (`errors.Is`-compatible), allowing handlers or HTTP servers to respond with `503 Service Unavailable / Retry-After`.
+- **Worker Drain Loop**: When triggered, workers drain in a loop until the queue/batch is empty before sleeping again.
+- **Error Backoff**: When database queries fail, workers pause for `ErrorBackoff` (default 1s) to prevent hot-loop CPU burns.
+
+#### `SQLQueueConfig` (Command Bus & Worker)
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `PollInterval` | `time.Duration` | `30s` | Fallback polling interval. `0` → default (`30s`), `<0` → disabled (wake-up only). |
+| `Notifier` | `Notifier` | `NewChannelNotifier()` | Source of wake-up signals. |
+| `DisableWakeup` | `bool` | `false` | When true, disables wake-up signaling (pure polling mode). |
+| `Concurrency` | `int` | `1` | Worker goroutines count (uses `SKIP LOCKED` on MySQL; forced to `1` on SQLite). |
+| `MaxPending` | `int` | `1000` | Backpressure limit. Returns `ErrQueueFull` if reached. `0` → default (`1000`), `<0` → no limit. |
+| `PendingCountCacheTTL` | `time.Duration` | `1s` | In-memory TTL for caching `COUNT(*)` pending. `<0` → disabled. |
+| `ErrorBackoff` | `time.Duration` | `1s` | Pause after database errors to avoid hot-looping. `<0` → disabled. |
+
+#### `SQLOutboxWorkerConfig` (Outbox Worker)
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TableName` | `string` | `"events"` | Outbox table name. Can also be inferred from `SQLOutbox.TableName()`. |
+| `PollInterval` | `time.Duration` | `30s` | Fallback polling interval. `0` → default (`30s`), `<0` → disabled. |
+| `BatchSize` | `int` | `50` | Batch size limit for polling/draining events. |
+| `Notifier` | `Notifier` | `NewChannelNotifier()` | Independent wake-up notifier instance for outbox. |
+| `ErrorBackoff` | `time.Duration` | `1s` | Pause after database errors. `<0` → disabled. |
+
+### 3. Configuration with Uber.fx
 
 Register the providers in your Uber.fx module:
 
@@ -167,7 +202,7 @@ fx.Provide(
     func(db *sql.DB) wcqrs.TransactionManager {
         return wcqrs.NewSQLTransactionManager(db)
     },
-    // Command Exec Store
+    // Command Execution Store
     func(db *sql.DB) wcqrs.CommandExecutionStore {
         dialect := wcqrs.DialectSQLite
         if os.Getenv("DB_DRIVER") == "mysql" {
@@ -175,12 +210,25 @@ fx.Provide(
         }
         return wcqrs.NewSQLCommandExecutionStore(db, "command_executions", dialect)
     },
-    // SQL Queue settings
+    // Command Bus & Queue Settings
     func() wcqrs.CommandBusConfig {
         return wcqrs.CommandBusConfig{
             UseSQLQueue:        true,
             WaitTimeout:        5 * time.Second,
             WaitTickerInterval: 100 * time.Millisecond,
+            SQLQueue: wcqrs.SQLQueueConfig{
+                PollInterval: 30 * time.Second,
+                Concurrency:  1,
+                MaxPending:   1000,
+            },
+        }
+    },
+    // Optional custom Outbox Worker settings
+    func() wcqrs.SQLOutboxWorkerConfig {
+        return wcqrs.SQLOutboxWorkerConfig{
+            TableName:    "events",
+            PollInterval: 30 * time.Second,
+            BatchSize:    50,
         }
     },
 )

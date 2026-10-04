@@ -26,6 +26,10 @@ func (m *mockTxManager) WithinTransaction(ctx context.Context, fn func(ctx conte
 	return fn(ctx, nil)
 }
 
+func (m *mockTxManager) AfterCommit(ctx context.Context, fn func()) {
+	RegisterAfterCommit(ctx, fn)
+}
+
 type mockTx struct {
 	Tx
 }

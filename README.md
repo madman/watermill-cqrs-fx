@@ -20,18 +20,21 @@ The module will provide:
 
 ## Transactional & Fault-Tolerant CQRS (SQL Queue & Outbox)
 
-This module supports a highly resilient, single-transaction CQRS execution cycle where:
+This module supports a highly resilient, single-transaction CQRS execution cycle with **hybrid in-process wake-up**:
 
-1. Commands are queued directly in a database table.
-2. Background workers execute commands inside a single database transaction using row-level locking (`FOR UPDATE SKIP LOCKED`).
-3. Domain changes and emitted events (Outbox) are written to the database atomically.
-4. An asynchronous Outbox worker guarantees **At-Least-Once** event delivery to local or remote handlers.
+1. **Commands** are queued directly in a database table (`command_executions`).
+2. **Immediate In-Process Wake-Up**: Dispatching a command immediately triggers worker processing via an in-process `Notifier` (sub-millisecond latency), eliminating aggressive 100ms database polling.
+3. **Background Workers** execute commands inside a single database transaction using row-level locking (`FOR UPDATE SKIP LOCKED`).
+4. **Domain changes and Outbox events** are committed atomically in that same transaction.
+5. **After-Commit Outbox Wake-Up**: Upon successful transaction commit, the outbox worker is woken immediately to dispatch pending events.
+6. **Backpressure**: When pending commands exceed `MaxPending` (default 1000), `CommandBus.Send()` returns `ErrQueueFull` (`errors.Is`-compatible).
+7. **Relaxed Fallback Polling**: A 30s fallback polling interval guarantees eventual recovery and multi-instance processing without burning database CPU at idle.
 
-For sequence diagrams, setup instructions, and deep technical details of this approach, please refer to the:
+For sequence diagrams, configuration tables, schema definitions, and migration instructions, see:
 👉 **[Transactional CQRS Documentation](docs/transactional_cqrs.md)**
 
 ## Technology Stack
 
-- **Go**: Primary programming language.
+- **Go**: Primary programming language (1.27+).
 - **Watermill**: Message library for Go.
 - **Uber.fx**: Dependency injection framework.

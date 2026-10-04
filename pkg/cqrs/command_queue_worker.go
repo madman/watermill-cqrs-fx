@@ -14,23 +14,40 @@ import (
 )
 
 type SQLCommandQueueWorker struct {
-	execStore    CommandExecutionStore
-	txManager    TransactionManager
-	marshaler    watermill_cqrs.CommandEventMarshaler
-	logger       watermill.LoggerAdapter
-	pollInterval time.Duration
-	handlers     map[string]CommandHandler
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
+	execStore      CommandExecutionStore
+	txManager      TransactionManager
+	marshaler      watermill_cqrs.CommandEventMarshaler
+	logger         watermill.LoggerAdapter
+	config         SQLQueueConfig
+	outboxNotifier Notifier
+	handlers       map[string]CommandHandler
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
 }
 
-func NewSQLCommandQueueWorker(
+// NewSQLCommandQueueWorkerWithConfig creates a new SQLCommandQueueWorker with custom queue config and optional outbox notifier.
+func NewSQLCommandQueueWorkerWithConfig(
 	execStore CommandExecutionStore,
 	txManager TransactionManager,
 	marshaler watermill_cqrs.CommandEventMarshaler,
 	logger watermill.LoggerAdapter,
 	rawHandlers []any,
+	cfg SQLQueueConfig,
+	outboxNotifier Notifier,
 ) (*SQLCommandQueueWorker, error) {
+	cfg.Normalize()
+
+	// Enforce single worker concurrency for non-MySQL dialects (e.g. SQLite lacks SKIP LOCKED)
+	dialect := cfg.Dialect
+	if dialect == "" {
+		if da, ok := execStore.(DialectAware); ok {
+			dialect = da.Dialect()
+		}
+	}
+	if dialect != DialectMySQL {
+		cfg.Concurrency = 1
+	}
+
 	handlers := make(map[string]CommandHandler)
 	for _, h := range rawHandlers {
 		if ch, ok := h.(CommandHandler); ok {
@@ -40,63 +57,115 @@ func NewSQLCommandQueueWorker(
 	}
 
 	return &SQLCommandQueueWorker{
-		execStore:    execStore,
-		txManager:    txManager,
-		marshaler:    marshaler,
-		logger:       logger,
-		pollInterval: 100 * time.Millisecond,
-		handlers:     handlers,
-		stopChan:     make(chan struct{}),
+		execStore:      execStore,
+		txManager:      txManager,
+		marshaler:      marshaler,
+		logger:         logger,
+		config:         cfg,
+		outboxNotifier: outboxNotifier,
+		handlers:       handlers,
+		stopChan:       make(chan struct{}),
 	}, nil
 }
 
+// NewSQLCommandQueueWorker creates a new SQLCommandQueueWorker with default configuration.
+func NewSQLCommandQueueWorker(
+	execStore CommandExecutionStore,
+	txManager TransactionManager,
+	marshaler watermill_cqrs.CommandEventMarshaler,
+	logger watermill.LoggerAdapter,
+	rawHandlers []any,
+) (*SQLCommandQueueWorker, error) {
+	return NewSQLCommandQueueWorkerWithConfig(
+		execStore,
+		txManager,
+		marshaler,
+		logger,
+		rawHandlers,
+		SQLQueueConfig{},
+		nil,
+	)
+}
+
 func (w *SQLCommandQueueWorker) Start(ctx context.Context) error {
-	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
-		w.logger.Info("Starting SQL Command Queue Worker", watermill.LogFields{
-			"registered_handlers": len(w.handlers),
-		})
+	w.logger.Info("Starting SQL Command Queue Worker", watermill.LogFields{
+		"registered_handlers": len(w.handlers),
+		"concurrency":         w.config.Concurrency,
+		"poll_interval":       w.config.PollInterval.String(),
+		"disable_wakeup":      w.config.DisableWakeup,
+	})
 
-		ticker := time.NewTicker(w.pollInterval)
+	for i := 0; i < w.config.Concurrency; i++ {
+		w.wg.Add(1)
+		workerID := i
+		go func() {
+			defer w.wg.Done()
+			w.runWorker(ctx, workerID)
+		}()
+	}
+	return nil
+}
+
+func (w *SQLCommandQueueWorker) runWorker(ctx context.Context, workerID int) {
+	// Immediate recovery drain upon worker start to pick up any pending commands from restart
+	w.drain(ctx)
+
+	var tickerChan <-chan time.Time
+	if w.config.PollInterval > 0 {
+		ticker := time.NewTicker(w.config.PollInterval)
 		defer ticker.Stop()
+		tickerChan = ticker.C
+	}
 
-		for {
-			select {
-			case <-w.stopChan:
-				w.logger.Info("Stopping SQL Command Queue Worker", nil)
-				return
-			case <-ctx.Done():
-				w.logger.Info("SQL Command Queue Worker context cancelled, stopping", nil)
-				return
-			case <-ticker.C:
-				processed, err := w.processNext(ctx)
-				if err != nil {
-					w.logger.Error("Failed processing SQL command", err, nil)
-				}
-				// If we processed a command, poll immediately again without waiting for the ticker
-				if processed {
-					for {
-						more, err := w.processNext(ctx)
-						if err != nil {
-							w.logger.Error("Failed processing SQL command", err, nil)
-						}
-						select {
-						case <-w.stopChan:
-							return
-						case <-ctx.Done():
-							return
-						default:
-						}
-						if !more {
-							break
-						}
-					}
+	var notifierChan <-chan struct{}
+	if !w.config.DisableWakeup && w.config.Notifier != nil {
+		notifierChan = w.config.Notifier.C()
+	}
+
+	for {
+		select {
+		case <-w.stopChan:
+			w.logger.Info("Stopping SQL Command Queue Worker", watermill.LogFields{"worker_id": workerID})
+			return
+		case <-ctx.Done():
+			w.logger.Info("SQL Command Queue Worker context cancelled, stopping", watermill.LogFields{"worker_id": workerID})
+			return
+		case <-tickerChan:
+			w.drain(ctx)
+		case <-notifierChan:
+			w.drain(ctx)
+		}
+	}
+}
+
+func (w *SQLCommandQueueWorker) drain(ctx context.Context) {
+	for {
+		select {
+		case <-w.stopChan:
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		processed, err := w.processNext(ctx)
+		if err != nil {
+			w.logger.Error("Failed processing SQL command", err, nil)
+			if w.config.ErrorBackoff > 0 {
+				select {
+				case <-w.stopChan:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(w.config.ErrorBackoff):
 				}
 			}
+			break
 		}
-	}()
-	return nil
+		if !processed {
+			break
+		}
+	}
 }
 
 func (w *SQLCommandQueueWorker) Stop() error {
@@ -189,6 +258,10 @@ func (w *SQLCommandQueueWorker) processNext(ctx context.Context) (bool, error) {
 			return true, nil
 		}
 		return processed, err
+	}
+
+	if processed && w.outboxNotifier != nil {
+		w.outboxNotifier.Notify()
 	}
 
 	return processed, nil

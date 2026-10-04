@@ -245,3 +245,20 @@ func (s *sqlCommandExecutionStore) GetNextPending(ctx context.Context, tx Tx) (*
 
 	return &exec, nil
 }
+
+func (s *sqlCommandExecutionStore) Dialect() Dialect {
+	return s.dialect
+}
+
+func (s *sqlCommandExecutionStore) CountPending(ctx context.Context, tx Tx) (int, error) {
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE status = ?`, s.tableName)
+
+	var count int
+	var err error
+	if tx != nil {
+		err = tx.QueryRowContext(ctx, query, CommandExecutionStatusPending).Scan(&count)
+	} else {
+		err = s.db.QueryRowContext(ctx, query, CommandExecutionStatusPending).Scan(&count)
+	}
+	return count, err
+}

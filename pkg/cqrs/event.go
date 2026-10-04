@@ -9,16 +9,35 @@ import (
 )
 
 type eventBus struct {
-	bus       *cqrs.EventBus
-	marshaler cqrs.CommandEventMarshaler
-	outbox    Outbox
+	bus            *cqrs.EventBus
+	marshaler      cqrs.CommandEventMarshaler
+	outbox         Outbox
+	txManager      TransactionManager
+	outboxNotifier Notifier
+}
+
+// EventBusConfig holds optional configuration for EventBus outbox wake-up signaling.
+type EventBusConfig struct {
+	TxManager      TransactionManager
+	OutboxNotifier Notifier
 }
 
 func NewEventBus(bus *cqrs.EventBus, marshaler cqrs.CommandEventMarshaler, outbox Outbox) EventBus {
+	return NewEventBusWithConfig(bus, marshaler, outbox, EventBusConfig{})
+}
+
+func NewEventBusWithConfig(
+	bus *cqrs.EventBus,
+	marshaler cqrs.CommandEventMarshaler,
+	outbox Outbox,
+	cfg EventBusConfig,
+) EventBus {
 	return &eventBus{
-		bus:       bus,
-		marshaler: marshaler,
-		outbox:    outbox,
+		bus:            bus,
+		marshaler:      marshaler,
+		outbox:         outbox,
+		txManager:      cfg.TxManager,
+		outboxNotifier: cfg.OutboxNotifier,
 	}
 }
 
@@ -40,7 +59,21 @@ func (b *eventBus) Publish(ctx context.Context, tx Tx, events ...Event) error {
 				OccurredAt: time.Now(),
 			})
 		}
-		return b.outbox.Save(ctx, tx, records...)
+		if err := b.outbox.Save(ctx, tx, records...); err != nil {
+			return err
+		}
+
+		if b.outboxNotifier != nil {
+			if b.txManager != nil {
+				b.txManager.AfterCommit(ctx, func() {
+					b.outboxNotifier.Notify()
+				})
+			} else if !RegisterAfterCommit(ctx, func() { b.outboxNotifier.Notify() }) {
+				b.outboxNotifier.Notify()
+			}
+		}
+
+		return nil
 	}
 
 	for _, event := range events {
