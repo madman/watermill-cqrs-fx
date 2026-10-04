@@ -1,6 +1,6 @@
 module github.com/madman/watermill-cqrs-fx
 
-go 1.25.1
+go 1.27.1
 
 require (
 	github.com/ThreeDotsLabs/watermill v1.5.1

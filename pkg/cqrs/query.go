@@ -70,7 +70,7 @@ func (b *queryBus) Execute(ctx context.Context, query Query, result any) error {
 
 	// copy result[0] to result pointer
 	resVal := reflect.ValueOf(result)
-	if resVal.Kind() != reflect.Ptr {
+	if resVal.Kind() != reflect.Pointer {
 		return fmt.Errorf("result must be a pointer")
 	}
 
