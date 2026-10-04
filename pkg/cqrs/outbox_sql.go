@@ -83,7 +83,12 @@ func (m *SQLTransactionManager) WithinTransaction(ctx context.Context, fn func(c
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	for _, cb := range hooks.afterCommit {
+	hooks.mu.Lock()
+	callbacks := make([]func(), len(hooks.afterCommit))
+	copy(callbacks, hooks.afterCommit)
+	hooks.mu.Unlock()
+
+	for _, cb := range callbacks {
 		cb()
 	}
 

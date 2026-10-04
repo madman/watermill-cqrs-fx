@@ -282,3 +282,22 @@ func TestSQLOutboxWorker_CustomTableName(t *testing.T) {
 		return pub.count("custom_topic") == 1
 	}, 1*time.Second, 20*time.Millisecond)
 }
+
+func TestSQLOutboxWorker_DoubleStop_NoPanic(t *testing.T) {
+	db := setupOutboxTestDB(t, "events")
+	defer func() { _ = db.Close() }()
+
+	pub := newMemoryPublisher()
+	logger := watermill.NopLogger{}
+	worker := NewSQLOutboxWorker(db, "events", pub, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, worker.Start(ctx))
+
+	assert.NotPanics(t, func() {
+		_ = worker.Stop()
+		_ = worker.Stop()
+	})
+}

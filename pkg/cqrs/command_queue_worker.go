@@ -22,6 +22,7 @@ type SQLCommandQueueWorker struct {
 	outboxNotifier Notifier
 	handlers       map[string]CommandHandler
 	stopChan       chan struct{}
+	stopOnce       sync.Once
 	wg             sync.WaitGroup
 }
 
@@ -165,11 +166,19 @@ func (w *SQLCommandQueueWorker) drain(ctx context.Context) {
 		if !processed {
 			break
 		}
+
+		// When concurrency > 1 and a command was processed, wake up peer workers
+		// so they can help drain remaining pending items concurrently.
+		if w.config.Concurrency > 1 && !w.config.DisableWakeup && w.config.Notifier != nil {
+			w.config.Notifier.Notify()
+		}
 	}
 }
 
 func (w *SQLCommandQueueWorker) Stop() error {
-	close(w.stopChan)
+	w.stopOnce.Do(func() {
+		close(w.stopChan)
+	})
 	w.wg.Wait()
 	return nil
 }

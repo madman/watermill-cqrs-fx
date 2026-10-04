@@ -19,21 +19,20 @@ import (
 func getMySQLTestDB(t *testing.T) *sql.DB {
 	dsn := os.Getenv("MYSQL_DSN")
 	if dsn == "" {
-		dsn = "mythology:mythology_password@tcp(localhost:3306)/mythology?parseTime=true"
+		t.Skip("skipping MySQL test: MYSQL_DSN not set")
+		return nil
 	}
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		t.Skipf("skipping MySQL test: failed to open MySQL connection: %v", err)
-		return nil
+		t.Fatalf("failed to open MySQL connection: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
-		t.Skipf("skipping MySQL test: MySQL not reachable at %s: %v", dsn, err)
-		return nil
+		t.Fatalf("MySQL not reachable at %s: %v", dsn, err)
 	}
 
 	_, err = db.Exec(`

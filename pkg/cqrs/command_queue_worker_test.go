@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -368,4 +369,67 @@ func (s *failingExecStore) GetNextPending(context.Context, Tx) (*CommandExecutio
 }
 func (s *failingExecStore) CountPending(context.Context, Tx) (int, error) {
 	return 0, s.err
+}
+
+func TestSQLCommandQueueWorker_DoubleStop_NoPanic(t *testing.T) {
+	db, store, tm := setupCommandQueueTestDB(t)
+	defer func() { _ = db.Close() }()
+
+	logger := watermill.NopLogger{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	worker, err := NewSQLCommandQueueWorker(store, tm, marshaler, logger, nil)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, worker.Start(ctx))
+
+	assert.NotPanics(t, func() {
+		_ = worker.Stop()
+		_ = worker.Stop()
+	})
+}
+
+type slowCountingExecStore struct {
+	failingExecStore
+	countCalls atomic.Int64
+}
+
+func (s *slowCountingExecStore) CountPending(context.Context, Tx) (int, error) {
+	s.countCalls.Add(1)
+	time.Sleep(30 * time.Millisecond)
+	return 5, nil
+}
+
+func (s *slowCountingExecStore) RecordPending(context.Context, Tx, string, string, []byte) error {
+	return nil
+}
+
+func TestCommandBus_CheckQueueCapacity_Singleflight(t *testing.T) {
+	store := &slowCountingExecStore{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			MaxPending:           10,
+			PendingCountCacheTTL: 10 * time.Millisecond,
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cmd := &testCmd{BaseCommand: NewBaseCommand(), Data: "test"}
+			_ = bus.Send(context.Background(), cmd)
+		}()
+	}
+	wg.Wait()
+
+	// With singleflight, concurrent calls to CountPending should be deduplicated to 1 call
+	assert.Equal(t, int64(1), store.countCalls.Load(), "concurrent CountPending calls should be deduplicated by singleflight")
 }

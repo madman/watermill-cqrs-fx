@@ -51,6 +51,7 @@ type SQLOutboxWorker struct {
 	logger    watermill.LoggerAdapter
 	config    SQLOutboxWorkerConfig
 	stopChan  chan struct{}
+	stopOnce  sync.Once
 	wg        sync.WaitGroup
 }
 
@@ -161,7 +162,9 @@ func (w *SQLOutboxWorker) drain(ctx context.Context) {
 }
 
 func (w *SQLOutboxWorker) Stop() error {
-	close(w.stopChan)
+	w.stopOnce.Do(func() {
+		close(w.stopChan)
+	})
 	w.wg.Wait()
 	return nil
 }

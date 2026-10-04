@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,4 +84,31 @@ func TestSQLTransactionManager_Rollback(t *testing.T) {
 	err = db.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
+}
+
+func TestSQLTransactionManager_ConcurrentRegisterAfterCommit(t *testing.T) {
+	db := setupTestDB(t)
+	defer func() { _ = db.Close() }()
+
+	tm := NewSQLTransactionManager(db)
+	var executedCount atomic.Int32
+
+	err := tm.WithinTransaction(context.Background(), func(ctx context.Context, tx Tx) error {
+		var wg sync.WaitGroup
+		const goroutines = 20
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ok := RegisterAfterCommit(ctx, func() {
+					executedCount.Add(1)
+				})
+				assert.True(t, ok)
+			}()
+		}
+		wg.Wait()
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(20), executedCount.Load())
 }
