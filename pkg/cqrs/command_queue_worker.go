@@ -113,12 +113,17 @@ func NewSQLCommandQueueWorkerWithBus(
 }
 
 func (w *SQLCommandQueueWorker) Start(ctx context.Context) error {
+	wakeupEnabled := w.config.Notifier != nil && !w.config.DisableWakeup
 	w.logger.Info("Starting SQL Command Queue Worker", watermill.LogFields{
 		"registered_handlers": len(w.handlers),
 		"concurrency":         w.config.Concurrency,
 		"poll_interval":       w.config.PollInterval.String(),
-		"disable_wakeup":      w.config.DisableWakeup,
+		"wakeup_enabled":      wakeupEnabled,
 	})
+
+	if w.config.Notifier == nil && !w.config.DisableWakeup {
+		w.logger.Info("SQL Command Queue Worker has no wake-up Notifier configured; operating in fallback polling mode only", nil)
+	}
 
 	for i := 0; i < w.config.Concurrency; i++ {
 		w.wg.Add(1)

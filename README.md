@@ -23,14 +23,14 @@ The module will provide:
 This module supports a highly resilient, single-transaction CQRS execution cycle with **hybrid in-process wake-up**:
 
 1. **Commands** are queued directly in a database table (`command_executions`).
-2. **Immediate In-Process Wake-Up**: Dispatching a command immediately triggers worker processing via an in-process `Notifier` (sub-millisecond latency), eliminating aggressive 100ms database polling.
+2. **Immediate In-Process Wake-Up**: Dispatching a command immediately triggers worker processing via an in-process `Notifier` (sub-millisecond latency), eliminating aggressive 100ms database polling. Works seamlessly both with Uber.fx (via automatic notifier wiring) and in standalone manual setups (via `NewSQLCommandQueueWorkerWithBus` or shared notifiers).
 3. **Background Workers** execute commands inside a single database transaction using row-level locking (`FOR UPDATE SKIP LOCKED`).
 4. **Domain changes and Outbox events** are committed atomically in that same transaction.
 5. **After-Commit Outbox Wake-Up**: Upon successful transaction commit, the outbox worker is woken immediately to dispatch pending events.
-6. **Backpressure**: When pending commands exceed `MaxPending` (default 1000), `CommandBus.Send()` returns `ErrQueueFull` (`errors.Is`-compatible).
+6. **Backpressure**: When pending commands exceed `MaxPending` (default 1000), `CommandBus.Send()` returns `ErrQueueFull` (`errors.Is`-compatible). Backpressure is optional and enabled via the `PendingCounter` interface.
 7. **Relaxed Fallback Polling**: A 30s fallback polling interval guarantees eventual recovery and multi-instance processing without burning database CPU at idle.
 
-For sequence diagrams, configuration tables, schema definitions, and migration instructions, see:
+For sequence diagrams, configuration tables, optional interfaces (`PendingCounter`, `AfterCommitter`, `NotifierProvider`), standalone manual wiring examples, and schema definitions, see:
 👉 **[Transactional CQRS Documentation](docs/transactional_cqrs.md)**
 
 ## Technology Stack

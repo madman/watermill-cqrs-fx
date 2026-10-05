@@ -88,11 +88,17 @@ func (w *SQLOutboxWorker) Start(ctx context.Context) error {
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
+		wakeupEnabled := w.config.Notifier != nil
 		w.logger.Info("Starting SQL Outbox Worker", watermill.LogFields{
-			"table":         w.config.TableName,
-			"poll_interval": w.config.PollInterval.String(),
-			"batch_size":    w.config.BatchSize,
+			"table":          w.config.TableName,
+			"poll_interval":  w.config.PollInterval.String(),
+			"batch_size":     w.config.BatchSize,
+			"wakeup_enabled": wakeupEnabled,
 		})
+
+		if !wakeupEnabled {
+			w.logger.Info("SQL Outbox Worker has no wake-up Notifier configured; operating in fallback polling mode only", nil)
+		}
 
 		// Immediate recovery drain on startup
 		w.drain(ctx)
