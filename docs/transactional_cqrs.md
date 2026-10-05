@@ -222,28 +222,39 @@ To preserve backward compatibility and avoid forcing third-party mocks or stores
 
   Implemented by `CommandBus`, `SQLCommandQueueWorker`, and `SQLOutboxWorker`, allowing components to expose their configured `Notifier`.
 
+- **`SQLQueueConfigProvider`**:
+
+  ```go
+  type SQLQueueConfigProvider interface {
+      SQLQueueConfig() SQLQueueConfig
+  }
+  ```
+
+  Implemented by `CommandBus`, allowing workers to reuse the complete `SQLQueueConfig` (concurrency, poll interval, backoff, and notifier) configured on the bus.
+
 ### 4. Manual Assembly (Without Uber.fx)
 
 When assembling components manually without Uber.fx, the wake-up notifier must be shared between the bus and the worker so that dispatches wake the worker immediately:
 
 #### Option A: Using `NewSQLCommandQueueWorkerWithBus` (Recommended)
 
-`NewCommandBus` automatically initializes an in-process `Notifier` if one is not provided. You can pass the bus directly to `NewSQLCommandQueueWorkerWithBus` to reuse that same notifier:
+`NewCommandBus` automatically initializes an in-process `Notifier` if one is not provided. `NewSQLCommandQueueWorkerWithBus` reuses the bus's full `SQLQueueConfig` (including `Notifier`, `Concurrency`, `PollInterval`, etc.) and accepts an optional `outboxNotifier`:
 
 ```go
-// 1. Create CommandBus (automatically initializes its own Notifier)
+// 1. Create CommandBus (automatically initializes its own Notifier and SQLQueueConfig)
 bus := wcqrs.NewCommandBus(watermillCmdBus, execStore, marshaler, wcqrs.CommandBusConfig{
     UseSQLQueue: true,
 })
 
-// 2. Create worker wired to the bus Notifier
+// 2. Create worker wired to the bus config and outbox notifier
 worker, err := wcqrs.NewSQLCommandQueueWorkerWithBus(
     execStore,
     txManager,
     marshaler,
     logger,
     handlers,
-    bus, // Automatically extracts bus.(wcqrs.NotifierProvider).Notifier()
+    bus,            // Reuses bus SQLQueueConfig & Notifier
+    outboxNotifier, // Wakes outbox worker upon command transaction commit
 )
 ```
 

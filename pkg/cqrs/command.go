@@ -150,6 +150,16 @@ func (b *commandBus) Notifier() Notifier {
 	return b.config.SQLQueue.Notifier
 }
 
+// SQLQueueConfigProvider is an optional interface implemented by buses that hold SQLQueueConfig.
+type SQLQueueConfigProvider interface {
+	SQLQueueConfig() SQLQueueConfig
+}
+
+// SQLQueueConfig returns the SQL queue configuration configured on this bus.
+func (b *commandBus) SQLQueueConfig() SQLQueueConfig {
+	return b.config.SQLQueue
+}
+
 func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
 	if b.config.SQLQueue.MaxPending <= 0 {
 		return nil
@@ -185,7 +195,10 @@ func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
 		}
 		b.pendingCountCache.mu.Unlock()
 
-		count, err := counter.CountPending(ctx, nil)
+		countCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+
+		count, err := counter.CountPending(countCtx, nil)
 		if err != nil {
 			return 0, fmt.Errorf("failed to count pending commands: %w", err)
 		}

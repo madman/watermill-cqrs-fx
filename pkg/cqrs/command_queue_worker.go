@@ -88,7 +88,8 @@ func NewSQLCommandQueueWorker(
 	)
 }
 
-// NewSQLCommandQueueWorkerWithBus creates a new SQLCommandQueueWorker reusing the wake-up Notifier from the given CommandBus.
+// NewSQLCommandQueueWorkerWithBus creates a new SQLCommandQueueWorker reusing the queue configuration
+// (including Notifier, Concurrency, PollInterval, and ErrorBackoff) from the CommandBus.
 func NewSQLCommandQueueWorkerWithBus(
 	execStore CommandExecutionStore,
 	txManager TransactionManager,
@@ -96,10 +97,13 @@ func NewSQLCommandQueueWorkerWithBus(
 	logger watermill.LoggerAdapter,
 	rawHandlers []any,
 	bus CommandBus,
+	outboxNotifier Notifier,
 ) (*SQLCommandQueueWorker, error) {
-	var notifier Notifier
-	if np, ok := bus.(NotifierProvider); ok {
-		notifier = np.Notifier()
+	cfg := SQLQueueConfig{}
+	if cp, ok := bus.(SQLQueueConfigProvider); ok {
+		cfg = cp.SQLQueueConfig()
+	} else if np, ok := bus.(NotifierProvider); ok {
+		cfg.Notifier = np.Notifier()
 	}
 	return NewSQLCommandQueueWorkerWithConfig(
 		execStore,
@@ -107,8 +111,8 @@ func NewSQLCommandQueueWorkerWithBus(
 		marshaler,
 		logger,
 		rawHandlers,
-		SQLQueueConfig{Notifier: notifier},
-		nil,
+		cfg,
+		outboxNotifier,
 	)
 }
 

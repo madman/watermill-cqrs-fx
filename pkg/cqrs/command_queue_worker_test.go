@@ -431,6 +431,45 @@ func TestCommandBus_CheckQueueCapacity_Singleflight(t *testing.T) {
 	assert.Equal(t, int64(1), store.countCalls.Load(), "concurrent CountPending calls should be deduplicated by singleflight")
 }
 
+func TestCommandBus_CheckQueueCapacity_SingleflightContextCancellation(t *testing.T) {
+	store := &slowCountingExecStore{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			MaxPending:           10,
+			PendingCountCacheTTL: 10 * time.Millisecond,
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	// Caller 1 has an already-canceled context
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var wg sync.WaitGroup
+	var errCaller2 error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		cmd1 := &testCmd{BaseCommand: NewBaseCommand(), Data: "test1"}
+		_ = bus.Send(canceledCtx, cmd1)
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(5 * time.Millisecond) // Ensure caller 1 enters singleflight first
+		cmd2 := &testCmd{BaseCommand: NewBaseCommand(), Data: "test2"}
+		errCaller2 = bus.Send(context.Background(), cmd2)
+	}()
+
+	wg.Wait()
+
+	// Caller 2 should succeed without inheriting caller 1's canceled context
+	assert.NoError(t, errCaller2, "caller 2 should not fail due to caller 1 canceling its context")
+}
+
 func TestCommandBus_StoreWithoutPendingCounter_BypassesLimit(t *testing.T) {
 	// failingExecStore implements CommandExecutionStore but does NOT implement PendingCounter
 	store := &failingExecStore{}
@@ -460,6 +499,8 @@ func TestSQLCommandQueueWorkerWithBus_SharesNotifier(t *testing.T) {
 		UseSQLQueue: true,
 		SQLQueue: SQLQueueConfig{
 			PollInterval: 1 * time.Hour, // long polling interval to prove wake-up handles it
+			Concurrency:  1,
+			ErrorBackoff: 2 * time.Second,
 		},
 	}
 	bus := NewCommandBus(nil, store, marshaler, busCfg)
@@ -470,10 +511,14 @@ func TestSQLCommandQueueWorkerWithBus_SharesNotifier(t *testing.T) {
 		return nil
 	})
 
-	worker, err := NewSQLCommandQueueWorkerWithBus(store, tm, marshaler, logger, []any{handler}, bus)
+	outboxNotifier := NewChannelNotifier()
+	worker, err := NewSQLCommandQueueWorkerWithBus(store, tm, marshaler, logger, []any{handler}, bus, outboxNotifier)
 	require.NoError(t, err)
 
-	// Verify notifier is shared between bus and worker
+	// Verify full SQLQueueConfig is reused from bus (PollInterval, ErrorBackoff, Notifier)
+	assert.Equal(t, 1*time.Hour, worker.config.PollInterval)
+	assert.Equal(t, 2*time.Second, worker.config.ErrorBackoff)
+
 	busNotifier := bus.(NotifierProvider).Notifier()
 	require.NotNil(t, busNotifier)
 	assert.Equal(t, busNotifier, worker.Notifier())
@@ -492,5 +537,13 @@ func TestSQLCommandQueueWorkerWithBus_SharesNotifier(t *testing.T) {
 		assert.Equal(t, "wake-up-from-bus", data)
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("worker was not woken up by bus Send signal")
+	}
+
+	// Verify outboxNotifier was notified upon successful command completion
+	select {
+	case <-outboxNotifier.C():
+		// outboxNotifier was successfully woken
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected outboxNotifier to be notified after command commit")
 	}
 }
