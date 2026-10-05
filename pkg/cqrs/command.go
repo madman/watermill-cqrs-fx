@@ -9,6 +9,7 @@ import (
 
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
 	"github.com/madman/cmderr"
+	"golang.org/x/sync/singleflight"
 )
 
 // CommandHandler defines the interface for handling commands with an explicit transaction.
@@ -66,6 +67,8 @@ type SQLQueueConfig struct {
 	// Concurrency is the number of worker goroutines. 0 -> default (1).
 	Concurrency int
 	// MaxPending is the backpressure limit for pending commands. 0 -> default (1000), <0 -> unlimited.
+	// Note: Because capacity checking is not atomic with command insertion and may use cached counts,
+	// MaxPending acts as a soft limit under concurrent load.
 	MaxPending int
 	// PendingCountCacheTTL is the TTL for caching COUNT(*) pending commands. 0 -> default (1s), <0 -> disabled.
 	PendingCountCacheTTL time.Duration
@@ -79,9 +82,6 @@ type SQLQueueConfig struct {
 func (cfg *SQLQueueConfig) Normalize() {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 30 * time.Second
-	}
-	if cfg.Notifier == nil {
-		cfg.Notifier = NewChannelNotifier()
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 1
@@ -115,6 +115,7 @@ type commandBus struct {
 	marshaler         cqrs.CommandEventMarshaler
 	config            CommandBusConfig
 	pendingCountCache pendingCountCache
+	countGroup        singleflight.Group
 }
 
 type pendingCountCache struct {
@@ -133,6 +134,9 @@ func NewCommandBus(
 		config.WaitTickerInterval = 200 * time.Millisecond
 	}
 	config.SQLQueue.Normalize()
+	if config.UseSQLQueue && config.SQLQueue.Notifier == nil && !config.SQLQueue.DisableWakeup {
+		config.SQLQueue.Notifier = NewChannelNotifier()
+	}
 	return &commandBus{
 		bus:       bus,
 		execStore: execStore,
@@ -141,8 +145,29 @@ func NewCommandBus(
 	}
 }
 
+// Notifier returns the wake-up Notifier used by this bus if SQL queueing is enabled.
+func (b *commandBus) Notifier() Notifier {
+	return b.config.SQLQueue.Notifier
+}
+
+// SQLQueueConfigProvider is an optional interface implemented by buses that hold SQLQueueConfig.
+type SQLQueueConfigProvider interface {
+	SQLQueueConfig() SQLQueueConfig
+}
+
+// SQLQueueConfig returns the SQL queue configuration configured on this bus.
+func (b *commandBus) SQLQueueConfig() SQLQueueConfig {
+	return b.config.SQLQueue
+}
+
 func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
 	if b.config.SQLQueue.MaxPending <= 0 {
+		return nil
+	}
+
+	counter, ok := b.execStore.(PendingCounter)
+	if !ok {
+		// If store does not implement PendingCounter, bypass MaxPending backpressure gracefully.
 		return nil
 	}
 
@@ -159,16 +184,37 @@ func (b *commandBus) checkQueueCapacity(ctx context.Context) error {
 	}
 	b.pendingCountCache.mu.Unlock()
 
-	count, err := b.execStore.CountPending(ctx, nil)
+	// Use singleflight to deduplicate concurrent COUNT(*) queries across parallel Sends when cache expires.
+	val, err, _ := b.countGroup.Do("count_pending", func() (any, error) {
+		b.pendingCountCache.mu.Lock()
+		now := time.Now()
+		if ttl > 0 && !b.pendingCountCache.cachedAt.IsZero() && now.Sub(b.pendingCountCache.cachedAt) < ttl {
+			cached := b.pendingCountCache.count
+			b.pendingCountCache.mu.Unlock()
+			return cached, nil
+		}
+		b.pendingCountCache.mu.Unlock()
+
+		countCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+
+		count, err := counter.CountPending(countCtx, nil)
+		if err != nil {
+			return 0, fmt.Errorf("failed to count pending commands: %w", err)
+		}
+
+		b.pendingCountCache.mu.Lock()
+		b.pendingCountCache.count = count
+		b.pendingCountCache.cachedAt = time.Now()
+		b.pendingCountCache.mu.Unlock()
+
+		return count, nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to count pending commands: %w", err)
+		return err
 	}
 
-	b.pendingCountCache.mu.Lock()
-	b.pendingCountCache.count = count
-	b.pendingCountCache.cachedAt = now
-	b.pendingCountCache.mu.Unlock()
-
+	count := val.(int)
 	if count >= b.config.SQLQueue.MaxPending {
 		return ErrQueueFull
 	}

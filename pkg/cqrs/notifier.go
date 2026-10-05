@@ -31,3 +31,9 @@ func (n *channelNotifier) Notify() {
 func (n *channelNotifier) C() <-chan struct{} {
 	return n.ch
 }
+
+// NotifierProvider is an optional interface implemented by components (such as CommandBus or workers)
+// that can expose their wake-up Notifier to enable explicit sharing across components.
+type NotifierProvider interface {
+	Notifier() Notifier
+}

@@ -9,6 +9,7 @@ require (
 	github.com/madman/cmderr v0.1.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/fx v1.24.0
+	golang.org/x/sync v0.23.0
 	modernc.org/sqlite v1.46.1
 )
 

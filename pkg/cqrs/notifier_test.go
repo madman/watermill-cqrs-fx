@@ -4,8 +4,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ThreeDotsLabs/watermill"
+	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx"
+	"go.uber.org/fx/fxtest"
 )
 
 func TestChannelNotifier_CoalescingAndNonBlocking(t *testing.T) {
@@ -48,7 +52,7 @@ func TestSQLQueueConfig_Normalize(t *testing.T) {
 	cfg.Normalize()
 
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
-	require.NotNil(t, cfg.Notifier)
+	assert.Nil(t, cfg.Notifier)
 	assert.False(t, cfg.DisableWakeup)
 	assert.Equal(t, 1, cfg.Concurrency)
 	assert.Equal(t, 1000, cfg.MaxPending)
@@ -80,7 +84,7 @@ func TestSQLOutboxWorkerConfig_Normalize(t *testing.T) {
 	assert.Equal(t, "events", cfg.TableName)
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
 	assert.Equal(t, 50, cfg.BatchSize)
-	require.NotNil(t, cfg.Notifier)
+	assert.Nil(t, cfg.Notifier)
 	assert.Equal(t, 1*time.Second, cfg.ErrorBackoff)
 
 	// Negative values should be preserved
@@ -96,4 +100,31 @@ func TestSQLOutboxWorkerConfig_Normalize(t *testing.T) {
 	assert.Equal(t, time.Duration(-1), negCfg.PollInterval)
 	assert.Equal(t, 50, negCfg.BatchSize)
 	assert.Equal(t, time.Duration(-1), negCfg.ErrorBackoff)
+}
+
+func TestFx_EventBusUsesOutboxConfigNotifier(t *testing.T) {
+	customNotifier := NewChannelNotifier()
+
+	var eb EventBus
+	app := fxtest.New(
+		t,
+		fx.Provide(
+			func() message.Publisher { return newMemoryPublisher() },
+			func() watermill.LoggerAdapter { return watermill.NopLogger{} },
+			func() SQLOutboxWorkerConfig {
+				return SQLOutboxWorkerConfig{
+					Notifier: customNotifier,
+				}
+			},
+		),
+		Module,
+		fx.Populate(&eb),
+	)
+	app.RequireStart()
+	defer app.RequireStop()
+
+	require.NotNil(t, eb)
+	busImpl, ok := eb.(*eventBus)
+	require.True(t, ok)
+	assert.Equal(t, customNotifier, busImpl.outboxNotifier)
 }

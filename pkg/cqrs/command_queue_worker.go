@@ -22,6 +22,7 @@ type SQLCommandQueueWorker struct {
 	outboxNotifier Notifier
 	handlers       map[string]CommandHandler
 	stopChan       chan struct{}
+	stopOnce       sync.Once
 	wg             sync.WaitGroup
 }
 
@@ -87,13 +88,46 @@ func NewSQLCommandQueueWorker(
 	)
 }
 
+// NewSQLCommandQueueWorkerWithBus creates a new SQLCommandQueueWorker reusing the queue configuration
+// (including Notifier, Concurrency, PollInterval, and ErrorBackoff) from the CommandBus.
+func NewSQLCommandQueueWorkerWithBus(
+	execStore CommandExecutionStore,
+	txManager TransactionManager,
+	marshaler watermill_cqrs.CommandEventMarshaler,
+	logger watermill.LoggerAdapter,
+	rawHandlers []any,
+	bus CommandBus,
+	outboxNotifier Notifier,
+) (*SQLCommandQueueWorker, error) {
+	cfg := SQLQueueConfig{}
+	if cp, ok := bus.(SQLQueueConfigProvider); ok {
+		cfg = cp.SQLQueueConfig()
+	} else if np, ok := bus.(NotifierProvider); ok {
+		cfg.Notifier = np.Notifier()
+	}
+	return NewSQLCommandQueueWorkerWithConfig(
+		execStore,
+		txManager,
+		marshaler,
+		logger,
+		rawHandlers,
+		cfg,
+		outboxNotifier,
+	)
+}
+
 func (w *SQLCommandQueueWorker) Start(ctx context.Context) error {
+	wakeupEnabled := w.config.Notifier != nil && !w.config.DisableWakeup
 	w.logger.Info("Starting SQL Command Queue Worker", watermill.LogFields{
 		"registered_handlers": len(w.handlers),
 		"concurrency":         w.config.Concurrency,
 		"poll_interval":       w.config.PollInterval.String(),
-		"disable_wakeup":      w.config.DisableWakeup,
+		"wakeup_enabled":      wakeupEnabled,
 	})
+
+	if w.config.Notifier == nil && !w.config.DisableWakeup {
+		w.logger.Info("SQL Command Queue Worker has no wake-up Notifier configured; operating in fallback polling mode only", nil)
+	}
 
 	for i := 0; i < w.config.Concurrency; i++ {
 		w.wg.Add(1)
@@ -165,13 +199,26 @@ func (w *SQLCommandQueueWorker) drain(ctx context.Context) {
 		if !processed {
 			break
 		}
+
+		// When concurrency > 1 and a command was processed, wake up peer workers
+		// so they can help drain remaining pending items concurrently.
+		if w.config.Concurrency > 1 && !w.config.DisableWakeup && w.config.Notifier != nil {
+			w.config.Notifier.Notify()
+		}
 	}
 }
 
 func (w *SQLCommandQueueWorker) Stop() error {
-	close(w.stopChan)
+	w.stopOnce.Do(func() {
+		close(w.stopChan)
+	})
 	w.wg.Wait()
 	return nil
+}
+
+// Notifier returns the wake-up Notifier configured for this queue worker, or nil if none.
+func (w *SQLCommandQueueWorker) Notifier() Notifier {
+	return w.config.Notifier
 }
 
 func (w *SQLCommandQueueWorker) processNext(ctx context.Context) (bool, error) {

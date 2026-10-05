@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -366,6 +367,183 @@ func (s *failingExecStore) GetNextPending(context.Context, Tx) (*CommandExecutio
 	s.callCount.Add(1)
 	return nil, s.err
 }
-func (s *failingExecStore) CountPending(context.Context, Tx) (int, error) {
-	return 0, s.err
+
+func TestSQLCommandQueueWorker_DoubleStop_NoPanic(t *testing.T) {
+	db, store, tm := setupCommandQueueTestDB(t)
+	defer func() { _ = db.Close() }()
+
+	logger := watermill.NopLogger{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	worker, err := NewSQLCommandQueueWorker(store, tm, marshaler, logger, nil)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, worker.Start(ctx))
+
+	assert.NotPanics(t, func() {
+		_ = worker.Stop()
+		_ = worker.Stop()
+	})
+}
+
+type slowCountingExecStore struct {
+	failingExecStore
+	countCalls atomic.Int64
+}
+
+func (s *slowCountingExecStore) CountPending(context.Context, Tx) (int, error) {
+	s.countCalls.Add(1)
+	time.Sleep(30 * time.Millisecond)
+	return 5, nil
+}
+
+func (s *slowCountingExecStore) RecordPending(context.Context, Tx, string, string, []byte) error {
+	return nil
+}
+
+func TestCommandBus_CheckQueueCapacity_Singleflight(t *testing.T) {
+	store := &slowCountingExecStore{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			MaxPending:           10,
+			PendingCountCacheTTL: 10 * time.Millisecond,
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cmd := &testCmd{BaseCommand: NewBaseCommand(), Data: "test"}
+			_ = bus.Send(context.Background(), cmd)
+		}()
+	}
+	wg.Wait()
+
+	// With singleflight, concurrent calls to CountPending should be deduplicated to 1 call
+	assert.Equal(t, int64(1), store.countCalls.Load(), "concurrent CountPending calls should be deduplicated by singleflight")
+}
+
+func TestCommandBus_CheckQueueCapacity_SingleflightContextCancellation(t *testing.T) {
+	store := &slowCountingExecStore{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			MaxPending:           10,
+			PendingCountCacheTTL: 10 * time.Millisecond,
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	// Caller 1 has an already-canceled context
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var wg sync.WaitGroup
+	var errCaller2 error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		cmd1 := &testCmd{BaseCommand: NewBaseCommand(), Data: "test1"}
+		_ = bus.Send(canceledCtx, cmd1)
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(5 * time.Millisecond) // Ensure caller 1 enters singleflight first
+		cmd2 := &testCmd{BaseCommand: NewBaseCommand(), Data: "test2"}
+		errCaller2 = bus.Send(context.Background(), cmd2)
+	}()
+
+	wg.Wait()
+
+	// Caller 2 should succeed without inheriting caller 1's canceled context
+	assert.NoError(t, errCaller2, "caller 2 should not fail due to caller 1 canceling its context")
+}
+
+func TestCommandBus_StoreWithoutPendingCounter_BypassesLimit(t *testing.T) {
+	// failingExecStore implements CommandExecutionStore but does NOT implement PendingCounter
+	store := &failingExecStore{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			MaxPending: 1, // should be bypassed because store lacks PendingCounter
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	// checkQueueCapacity should return nil without failing
+	cb := bus.(*commandBus)
+	err := cb.checkQueueCapacity(context.Background())
+	assert.NoError(t, err)
+}
+
+func TestSQLCommandQueueWorkerWithBus_SharesNotifier(t *testing.T) {
+	db, store, tm := setupCommandQueueTestDB(t)
+	defer func() { _ = db.Close() }()
+
+	logger := watermill.NopLogger{}
+	marshaler := watermill_cqrs.JSONMarshaler{}
+
+	busCfg := CommandBusConfig{
+		UseSQLQueue: true,
+		SQLQueue: SQLQueueConfig{
+			PollInterval: 1 * time.Hour, // long polling interval to prove wake-up handles it
+			Concurrency:  1,
+			ErrorBackoff: 2 * time.Second,
+		},
+	}
+	bus := NewCommandBus(nil, store, marshaler, busCfg)
+
+	received := make(chan string, 1)
+	handler := NewCommandHandler("busHandler", func(ctx context.Context, tx Tx, cmd *testCmd) error {
+		received <- cmd.Data
+		return nil
+	})
+
+	outboxNotifier := NewChannelNotifier()
+	worker, err := NewSQLCommandQueueWorkerWithBus(store, tm, marshaler, logger, []any{handler}, bus, outboxNotifier)
+	require.NoError(t, err)
+
+	// Verify full SQLQueueConfig is reused from bus (PollInterval, ErrorBackoff, Notifier)
+	assert.Equal(t, 1*time.Hour, worker.config.PollInterval)
+	assert.Equal(t, 2*time.Second, worker.config.ErrorBackoff)
+
+	busNotifier := bus.(NotifierProvider).Notifier()
+	require.NotNil(t, busNotifier)
+	assert.Equal(t, busNotifier, worker.Notifier())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, worker.Start(ctx))
+	defer func() { _ = worker.Stop() }()
+
+	cmd := &testCmd{BaseCommand: NewBaseCommand(), Data: "wake-up-from-bus"}
+	require.NoError(t, bus.Send(ctx, cmd))
+
+	select {
+	case data := <-received:
+		assert.Equal(t, "wake-up-from-bus", data)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("worker was not woken up by bus Send signal")
+	}
+
+	// Verify outboxNotifier was notified upon successful command completion
+	select {
+	case <-outboxNotifier.C():
+		// outboxNotifier was successfully woken
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected outboxNotifier to be notified after command commit")
+	}
 }

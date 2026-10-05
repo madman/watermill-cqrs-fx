@@ -57,8 +57,8 @@ func (m *memoryTxManager) WithinTransaction(ctx context.Context, fn func(ctx con
 	return nil
 }
 
-func (m *memoryTxManager) AfterCommit(ctx context.Context, fn func()) {
-	wcqrs.RegisterAfterCommit(ctx, fn)
+func (m *memoryTxManager) AfterCommit(ctx context.Context, fn func()) bool {
+	return wcqrs.RegisterAfterCommit(ctx, fn)
 }
 
 // --- Handlers ---

@@ -37,9 +37,6 @@ func (cfg *SQLOutboxWorkerConfig) Normalize() {
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 50
 	}
-	if cfg.Notifier == nil {
-		cfg.Notifier = NewChannelNotifier()
-	}
 	if cfg.ErrorBackoff == 0 {
 		cfg.ErrorBackoff = 1 * time.Second
 	}
@@ -51,6 +48,7 @@ type SQLOutboxWorker struct {
 	logger    watermill.LoggerAdapter
 	config    SQLOutboxWorkerConfig
 	stopChan  chan struct{}
+	stopOnce  sync.Once
 	wg        sync.WaitGroup
 }
 
@@ -90,11 +88,17 @@ func (w *SQLOutboxWorker) Start(ctx context.Context) error {
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
+		wakeupEnabled := w.config.Notifier != nil
 		w.logger.Info("Starting SQL Outbox Worker", watermill.LogFields{
-			"table":         w.config.TableName,
-			"poll_interval": w.config.PollInterval.String(),
-			"batch_size":    w.config.BatchSize,
+			"table":          w.config.TableName,
+			"poll_interval":  w.config.PollInterval.String(),
+			"batch_size":     w.config.BatchSize,
+			"wakeup_enabled": wakeupEnabled,
 		})
+
+		if !wakeupEnabled {
+			w.logger.Info("SQL Outbox Worker has no wake-up Notifier configured; operating in fallback polling mode only", nil)
+		}
 
 		// Immediate recovery drain on startup
 		w.drain(ctx)
@@ -161,9 +165,16 @@ func (w *SQLOutboxWorker) drain(ctx context.Context) {
 }
 
 func (w *SQLOutboxWorker) Stop() error {
-	close(w.stopChan)
+	w.stopOnce.Do(func() {
+		close(w.stopChan)
+	})
 	w.wg.Wait()
 	return nil
+}
+
+// Notifier returns the wake-up Notifier configured for this outbox worker, or nil if none.
+func (w *SQLOutboxWorker) Notifier() Notifier {
+	return w.config.Notifier
 }
 
 func (w *SQLOutboxWorker) processBatch(ctx context.Context) (int, error) {

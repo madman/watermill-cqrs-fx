@@ -64,11 +64,18 @@ func (b *eventBus) Publish(ctx context.Context, tx Tx, events ...Event) error {
 		}
 
 		if b.outboxNotifier != nil {
-			if b.txManager != nil {
-				b.txManager.AfterCommit(ctx, func() {
+			registered := false
+			if ac, ok := b.txManager.(AfterCommitter); ok {
+				registered = ac.AfterCommit(ctx, func() {
 					b.outboxNotifier.Notify()
 				})
-			} else if !RegisterAfterCommit(ctx, func() { b.outboxNotifier.Notify() }) {
+			} else {
+				registered = RegisterAfterCommit(ctx, func() {
+					b.outboxNotifier.Notify()
+				})
+			}
+
+			if !registered {
 				b.outboxNotifier.Notify()
 			}
 		}

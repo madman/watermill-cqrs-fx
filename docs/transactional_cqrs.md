@@ -171,10 +171,10 @@ Instead of aggressive constant database polling (10-20 queries/s at idle), worke
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `PollInterval` | `time.Duration` | `30s` | Fallback polling interval. `0` → default (`30s`), `<0` → disabled (wake-up only). |
-| `Notifier` | `Notifier` | `NewChannelNotifier()` | Source of wake-up signals. |
+| `Notifier` | `Notifier` | `nil` | Source of wake-up signals. In Fx mode, auto-wired from `Module`. In `NewCommandBus`, auto-created if nil and wake-up enabled. |
 | `DisableWakeup` | `bool` | `false` | When true, disables wake-up signaling (pure polling mode). |
 | `Concurrency` | `int` | `1` | Worker goroutines count (uses `SKIP LOCKED` on MySQL; forced to `1` on SQLite). |
-| `MaxPending` | `int` | `1000` | Backpressure limit. Returns `ErrQueueFull` if reached. `0` → default (`1000`), `<0` → no limit. |
+| `MaxPending` | `int` | `1000` | Backpressure limit. Returns `ErrQueueFull` if reached. `0` → default (`1000`), `<0` → no limit. Requires `PendingCounter`. |
 | `PendingCountCacheTTL` | `time.Duration` | `1s` | In-memory TTL for caching `COUNT(*)` pending. `<0` → disabled. |
 | `ErrorBackoff` | `time.Duration` | `1s` | Pause after database errors to avoid hot-looping. `<0` → disabled. |
 
@@ -185,12 +185,126 @@ Instead of aggressive constant database polling (10-20 queries/s at idle), worke
 | `TableName` | `string` | `"events"` | Outbox table name. Can also be inferred from `SQLOutbox.TableName()`. |
 | `PollInterval` | `time.Duration` | `30s` | Fallback polling interval. `0` → default (`30s`), `<0` → disabled. |
 | `BatchSize` | `int` | `50` | Batch size limit for polling/draining events. |
-| `Notifier` | `Notifier` | `NewChannelNotifier()` | Independent wake-up notifier instance for outbox. |
+| `Notifier` | `Notifier` | `nil` | Independent wake-up notifier instance for outbox. In Fx mode, auto-wired via `name:"outbox_notifier"`. |
 | `ErrorBackoff` | `time.Duration` | `1s` | Pause after database errors. `<0` → disabled. |
 
-### 3. Configuration with Uber.fx
+### 3. Optional Interfaces & Backward Compatibility
 
-Register the providers in your Uber.fx module:
+To preserve backward compatibility and avoid forcing third-party mocks or stores to implement new methods:
+
+- **`PendingCounter`**:
+
+  ```go
+  type PendingCounter interface {
+      CountPending(ctx context.Context, tx Tx) (int, error)
+  }
+  ```
+
+  Implemented by `SQLCommandExecutionStore`. If a custom `CommandExecutionStore` does not implement `PendingCounter`, the `MaxPending` queue capacity check is gracefully bypassed without errors.
+
+- **`AfterCommitter`**:
+
+  ```go
+  type AfterCommitter interface {
+      AfterCommit(ctx context.Context, fn func()) bool
+  }
+  ```
+
+  Implemented by `SQLTransactionManager`. If a transaction manager does not implement `AfterCommitter`, `EventBus.Publish` attempts `RegisterAfterCommit(ctx, ...)`, and falls back to immediate notification if the transaction was opened outside `WithinTransaction`.
+
+- **`NotifierProvider`**:
+
+  ```go
+  type NotifierProvider interface {
+      Notifier() Notifier
+  }
+  ```
+
+  Implemented by `CommandBus`, `SQLCommandQueueWorker`, and `SQLOutboxWorker`, allowing components to expose their configured `Notifier`.
+
+- **`SQLQueueConfigProvider`**:
+
+  ```go
+  type SQLQueueConfigProvider interface {
+      SQLQueueConfig() SQLQueueConfig
+  }
+  ```
+
+  Implemented by `CommandBus`, allowing workers to reuse the complete `SQLQueueConfig` (concurrency, poll interval, backoff, and notifier) configured on the bus.
+
+### 4. Manual Assembly (Without Uber.fx)
+
+When assembling components manually without Uber.fx, the wake-up notifier must be shared between the bus and the worker so that dispatches wake the worker immediately:
+
+#### Option A: Using `NewSQLCommandQueueWorkerWithBus` (Recommended)
+
+`NewCommandBus` automatically initializes an in-process `Notifier` if one is not provided. `NewSQLCommandQueueWorkerWithBus` reuses the bus's full `SQLQueueConfig` (including `Notifier`, `Concurrency`, `PollInterval`, etc.) and accepts an optional `outboxNotifier`:
+
+```go
+// 1. Create CommandBus (automatically initializes its own Notifier and SQLQueueConfig)
+bus := wcqrs.NewCommandBus(watermillCmdBus, execStore, marshaler, wcqrs.CommandBusConfig{
+    UseSQLQueue: true,
+})
+
+// 2. Create worker wired to the bus config and outbox notifier
+worker, err := wcqrs.NewSQLCommandQueueWorkerWithBus(
+    execStore,
+    txManager,
+    marshaler,
+    logger,
+    handlers,
+    bus,            // Reuses bus SQLQueueConfig & Notifier
+    outboxNotifier, // Wakes outbox worker upon command transaction commit
+)
+```
+
+#### Option B: Sharing an Explicit `Notifier`
+
+Alternatively, you can instantiate `NewChannelNotifier()` yourself and pass it to both components:
+
+```go
+// Shared notifiers
+cmdNotifier := wcqrs.NewChannelNotifier()
+outboxNotifier := wcqrs.NewChannelNotifier()
+
+// Command Bus
+bus := wcqrs.NewCommandBus(watermillCmdBus, execStore, marshaler, wcqrs.CommandBusConfig{
+    UseSQLQueue: true,
+    SQLQueue: wcqrs.SQLQueueConfig{
+        Notifier: cmdNotifier,
+    },
+})
+
+// Command Queue Worker
+queueWorker, err := wcqrs.NewSQLCommandQueueWorkerWithConfig(
+    execStore,
+    txManager,
+    marshaler,
+    logger,
+    handlers,
+    wcqrs.SQLQueueConfig{
+        Notifier: cmdNotifier,
+    },
+    outboxNotifier, // Wakes outbox worker upon command transaction commit
+)
+
+// Event Bus (Outbox)
+eventBus := wcqrs.NewEventBusWithConfig(watermillEventBus, marshaler, outbox, wcqrs.EventBusConfig{
+    TxManager:      txManager,
+    OutboxNotifier: outboxNotifier,
+})
+
+// Outbox Worker
+outboxWorker := wcqrs.NewSQLOutboxWorkerWithConfig(db, publisher, logger, wcqrs.SQLOutboxWorkerConfig{
+    Notifier: outboxNotifier,
+})
+```
+
+> **Note**: If a worker is instantiated without a `Notifier` (e.g. `SQLQueueConfig{}`), it will log a notice at startup and operate in fallback polling mode (every 30s) without wake-up signals.
+
+### 5. Configuration with Uber.fx
+
+When using Uber.fx, `wcqrs.Module` automatically provides named notifiers (`"command_notifier"` and `"outbox_notifier"`), wires them between the buses and workers, and respects any custom overrides passed via `CommandBusConfig.SQLQueue.Notifier` or `SQLOutboxWorkerConfig.Notifier`:
 
 ```go
 fx.Provide(

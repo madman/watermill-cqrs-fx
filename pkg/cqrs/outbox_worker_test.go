@@ -208,6 +208,21 @@ func TestEventBus_AfterCommitNotificationAndRollback(t *testing.T) {
 	default:
 		// Clean, no wake-up signal
 	}
+
+	// 3. Manual transaction outside WithinTransaction: Publish MUST fire outboxNotifier immediately as fallback
+	manualTx, err := db.Begin()
+	require.NoError(t, err)
+	defer func() { _ = manualTx.Rollback() }()
+
+	err = eb.Publish(context.Background(), manualTx, testEvent{Greeting: "Manual Tx"})
+	require.NoError(t, err)
+
+	select {
+	case <-outboxNotifier.C():
+		// Correct: fallback immediate wake-up fired
+	default:
+		t.Fatal("expected outboxNotifier to fire immediately for transaction outside WithinTransaction")
+	}
 }
 
 func TestSQLOutboxWorker_DrainBatchLoop(t *testing.T) {
@@ -281,4 +296,23 @@ func TestSQLOutboxWorker_CustomTableName(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return pub.count("custom_topic") == 1
 	}, 1*time.Second, 20*time.Millisecond)
+}
+
+func TestSQLOutboxWorker_DoubleStop_NoPanic(t *testing.T) {
+	db := setupOutboxTestDB(t, "events")
+	defer func() { _ = db.Close() }()
+
+	pub := newMemoryPublisher()
+	logger := watermill.NopLogger{}
+	worker := NewSQLOutboxWorker(db, "events", pub, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, worker.Start(ctx))
+
+	assert.NotPanics(t, func() {
+		_ = worker.Stop()
+		_ = worker.Stop()
+	})
 }

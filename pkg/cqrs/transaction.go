@@ -3,6 +3,7 @@ package cqrs
 import (
 	"context"
 	"database/sql"
+	"sync"
 )
 
 // Tx defines the interface for database transactions.
@@ -20,6 +21,7 @@ var _ Tx = (*sql.Tx)(nil)
 type txHooksKey struct{}
 
 type txHooks struct {
+	mu          sync.Mutex
 	afterCommit []func()
 }
 
@@ -30,7 +32,9 @@ func RegisterAfterCommit(ctx context.Context, fn func()) bool {
 		return false
 	}
 	if h, ok := ctx.Value(txHooksKey{}).(*txHooks); ok && h != nil {
+		h.mu.Lock()
 		h.afterCommit = append(h.afterCommit, fn)
+		h.mu.Unlock()
 		return true
 	}
 	return false
